@@ -16,4 +16,4 @@
 - **カスタマイズ可能なメニューバー** — よく使う機能だけを好きな順番で並べられます
 ### プライバシー
 
-本アプリは利用者の情報を一切収集しません。ネットワーク通信の権限すら持っていないため、書いた文章が外部に送信されることは技術的にありません。詳しくは[プライバシーポリシー](https://github.com/KuriharaKageri/KageriEditor/blob/main/PrivacyPolicy.md) をご覧ください。
+本アプリは利用者の情報を一切収集しません。ネットワーク通信の権限を持たないため、書いた文章が外部に送信されることは技術的にありません。詳しくは[プライバシーポリシー](https://github.com/KuriharaKageri/KageriEditor/blob/main/PrivacyPolicy.md) をご覧ください。
