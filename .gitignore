@@ -1,0 +1,6 @@
+# ビルド生成物（build.sh / make_dist.sh が作る。GitHubにはReleaseとして添付する）
+build/
+dist/
+
+# macOS
+.DS_Store
