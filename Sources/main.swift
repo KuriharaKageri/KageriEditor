@@ -968,9 +968,13 @@ final class Document: NSDocument, NSTextViewDelegate {
         // 既に他のドキュメントウインドウが開いている時は、既定の中央位置・サイズに
         // 戻すのではなく、そのウインドウの位置とサイズを維持する（「新規」でも「開く」でも）。
         // タブでまとめる設定がオンの場合は、一度既定位置で作ってから合流させることで
-        // その一瞬のフレーム不一致のせいで毎回位置がずれて見える問題も同時に防げる
+        // その一瞬のフレーム不一致のせいで毎回位置がずれて見える問題も同時に防げる。
+        // 1つも開いていない時（全部閉じたあとの「新規」やアプリ起動直後）は、
+        // 最後に使っていた枠を覚えているのでそこへ開く。覚えていなければ中央。
         if let existing = Document.anotherVisibleDocumentWindow(excluding: window) {
             window.setFrame(existing.frame, display: false)
+        } else if let remembered = Document.lastWindowFrame() {
+            window.setFrame(remembered, display: false)
         } else {
             window.center()
         }
@@ -1167,6 +1171,9 @@ final class Document: NSDocument, NSTextViewDelegate {
         self.menuBarView = menuBar
 
         let windowController = NSWindowController(window: window)
+        // AppKitの自動カスケードを切る。既定のままだと、上で決めた枠が表示の直前に
+        // 右下へ少しずつずらされ、ウインドウが開くたびに位置が変わってしまう
+        windowController.shouldCascadeWindows = false
         addWindowController(windowController)
         // ウインドウがまだ画面に出る前にタブグループへ合流させておく（表示後に合流させると
         // 単独ウインドウとして一瞬映ってからタブへ吸い込まれるように見えてしまうため）
@@ -1187,6 +1194,34 @@ final class Document: NSDocument, NSTextViewDelegate {
         NotificationCenter.default.addObserver(
             self, selector: #selector(menuOrderChanged),
             name: MenuBarView.orderChangedNotification, object: nil)
+        // 次にウインドウが1つも無い状態から開くときのために、枠を覚えておく
+        for name in [NSWindow.didMoveNotification, NSWindow.didResizeNotification,
+                     NSWindow.willCloseNotification] {
+            NotificationCenter.default.addObserver(
+                self, selector: #selector(rememberWindowFrame(_:)), name: name, object: window)
+        }
+    }
+
+    // ---------- ウインドウ位置の記憶 ----------
+
+    private static let lastWindowFrameKey = "lastWindowFrame"
+
+    @objc private func rememberWindowFrame(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow else { return }
+        UserDefaults.standard.set(NSStringFromRect(window.frame), forKey: Document.lastWindowFrameKey)
+    }
+
+    /// 最後に使っていたドキュメントウインドウの枠。外部ディスプレイを外した後などに
+    /// 画面の外へ開いてしまわないよう、今つながっている画面と十分に重なる場合だけ返す
+    static func lastWindowFrame() -> NSRect? {
+        guard let saved = UserDefaults.standard.string(forKey: lastWindowFrameKey) else { return nil }
+        let frame = NSRectFromString(saved)
+        guard frame.width >= 200, frame.height >= 200 else { return nil }
+        let usable = NSScreen.screens.contains { screen in
+            let overlap = screen.visibleFrame.intersection(frame)
+            return overlap.width >= 160 && overlap.height >= 160
+        }
+        return usable ? frame : nil
     }
 
     @objc private func menuOrderChanged() {
@@ -1292,7 +1327,7 @@ final class Document: NSDocument, NSTextViewDelegate {
 
     /// 選択範囲（なければ文書全体）にテキスト変換を適用する。
     /// 選択が行の途中から始まっていても・途中で終わっていても、その行全体を
-    /// 選択しているものとみなして行単位で処理する（整形・非整形・空行除去・スペース除去で共通）。
+    /// 選択しているものとみなして行単位で処理する（整形・非整形・空行除去・原稿支援で共通）。
     private func applyTransform(_ transform: (String) -> String) {
         guard let tv = textView else { return }
         let full = tv.string as NSString
@@ -1329,34 +1364,179 @@ final class Document: NSDocument, NSTextViewDelegate {
         tv.setSelectedRange(NSRange(location: min(caret, newLength), length: 0))
     }
 
-    /// 改行だけを取り除く（スペース除去は独立した「スペース除去」コマンドが担当する）
+    /// 改行だけを取り除く（スペースの除去は「原稿支援」のダイアログが担当する）
     @objc func removeNewlinesCommand(_ sender: Any?) {
         let noParagraphDetect = UserDefaults.standard.bool(forKey: "noParagraphDetect")
         applyTransform { TextTransform.removeNewlines($0, recognizeParagraphs: !noParagraphDetect) }
     }
 
-    /// 設定で指定した全角／半角スペースを取り除く
-    @objc func removeSpacesCommand(_ sender: Any?) {
-        let removeFullWidth = UserDefaults.standard.bool(forKey: "removeFullWidthSpace")
-        let removeHalfWidth = UserDefaults.standard.bool(forKey: "removeHalfWidthSpace")
-        let noParagraphDetect = UserDefaults.standard.bool(forKey: "noParagraphDetect")
-        guard removeFullWidth || removeHalfWidth else {
-            let alert = NSAlert()
-            alert.messageText = "除去するスペースが選ばれていません"
-            alert.informativeText = "設定で「全角スペース」「半角スペース」のどちらを除去するか選んでください。"
-            alert.addButton(withTitle: "OK")
-            alert.runModal()
-            return
+    /// 原稿支援。書き上げたあとの体裁を整える処理をダイアログでまとめて選び、1回で適用する。
+    /// 除去 → 文字種の変換 → 追加 の順に走るので、「行頭スペースをいったん除去してから
+    /// 規則正しく付け直す」といった手順もチェックを2つ入れるだけで済む。
+    /// 頻繁に使う機能ではないためダイアログを挟む（空行除去・非整形は即実行のまま残す）。
+    @objc func manuscriptAssistCommand(_ sender: Any?) {
+        let defaults = UserDefaults.standard
+
+        func heading(_ label: String) -> NSTextField {
+            let field = NSTextField(labelWithString: label)
+            field.font = NSFont.boldSystemFont(ofSize: NSFont.systemFontSize)
+            return field
         }
-        applyTransform {
-            TextTransform.removeSpaces(
-                $0,
-                removeFullWidth: removeFullWidth,
-                removeHalfWidth: removeHalfWidth,
-                protectLeadingIndent: !noParagraphDetect
-            )
+        func note(_ label: String) -> NSTextField {
+            let field = NSTextField(wrappingLabelWithString: label)
+            field.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
+            field.textColor = .secondaryLabelColor
+            field.preferredMaxLayoutWidth = assistDialogWidth - 44
+            return field
+        }
+        func check(_ label: String, _ key: String) -> NSButton {
+            let box = NSButton(checkboxWithTitle: label, target: nil, action: nil)
+            box.state = defaults.bool(forKey: key) ? .on : .off
+            return box
+        }
+        /// 見出しの下にぶら下がる項目を字下げして、どの見出しに属するか見分けられるようにする
+        func indented(_ view: NSView, by amount: CGFloat) -> NSView {
+            let spacer = NSView()
+            spacer.translatesAutoresizingMaskIntoConstraints = false
+            spacer.widthAnchor.constraint(equalToConstant: amount).isActive = true
+            let row = NSStackView(views: [spacer, view])
+            row.orientation = .horizontal
+            row.spacing = 0
+            row.alignment = .top
+            return row
+        }
+
+        let removeHalf = check("半角スペース", "assistRemoveHalf")
+        let removeFull = check("全角スペース", "assistRemoveFull")
+        let removeTab = check("タブ", "assistRemoveTab")
+        let removeIndent = check("行頭の字下げも除去する", "assistRemoveIndent")
+        let digits = check("数字を半角に", "assistDigits")
+        let addIndent = check("行頭の字下げ（一字下げ）", "assistAddIndent")
+        let addBlank = check("段落の間に空行", "assistAddBlank")
+
+        // ラジオボタンは同じ親ビュー・同じアクションを共有することで排他になる。
+        // 選ばれた値は「実行」を押した時点でまとめて読むので、アクション自体は何もしない
+        let alphaKeep = NSButton(radioButtonWithTitle: "そのまま",
+                                 target: self, action: #selector(assistAlphabetChanged(_:)))
+        let alphaFull = NSButton(radioButtonWithTitle: "全角に",
+                                 target: self, action: #selector(assistAlphabetChanged(_:)))
+        let alphaHalf = NSButton(radioButtonWithTitle: "半角に",
+                                 target: self, action: #selector(assistAlphabetChanged(_:)))
+        switch defaults.string(forKey: "assistAlphabet") ?? "keep" {
+        case "full": alphaFull.state = .on
+        case "half": alphaHalf.state = .on
+        default: alphaKeep.state = .on
+        }
+        let alphabetRow = NSStackView(views: [alphaKeep, alphaFull, alphaHalf])
+        alphabetRow.orientation = .horizontal
+        alphabetRow.spacing = 16
+
+        // 前回の選択が残るので、選び直したいときに1つずつ外さなくて済むようにする
+        let allOffButton = NSButton(title: "すべてオフ", target: self, action: #selector(assistAllOff(_:)))
+        allOffButton.bezelStyle = .rounded
+        allOffButton.controlSize = .small
+
+        let stack = NSStackView(views: [
+            heading("除去する"),
+            indented(removeHalf, by: 12),
+            indented(removeFull, by: 12),
+            indented(removeTab, by: 12),
+            indented(removeIndent, by: 12),
+            heading("文字種を揃える"),
+            indented(digits, by: 12),
+            indented(NSTextField(labelWithString: "アルファベット"), by: 12),
+            indented(alphabetRow, by: 32),
+            heading("追加する"),
+            indented(addIndent, by: 12),
+            indented(note("会話文のカッコや箇条書き記号で始まる行、空行には字下げを追加しません。"), by: 32),
+            indented(addBlank, by: 12),
+            indented(note("すべての改行の直後に1行あけます。段落の見分けはしないので、すでに空行がある場所はそのぶん増えます。"), by: 32),
+            allOffButton,
+        ])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 6
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        // NSAlertのアクセサリビューは自動レイアウトの結果をframeに落とし込んでから渡す必要がある
+        let container = NSView()
+        container.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: container.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            stack.widthAnchor.constraint(equalToConstant: assistDialogWidth),
+        ])
+        container.frame = NSRect(x: 0, y: 0, width: assistDialogWidth, height: stack.fittingSize.height)
+
+        let checkBoxes = [removeHalf, removeFull, removeTab, removeIndent, digits, addIndent, addBlank]
+        Document.assistDialogControls = (checkBoxes, [alphaKeep, alphaFull, alphaHalf])
+        defer { Document.assistDialogControls = nil }
+
+        let alert = NSAlert()
+        alert.messageText = "原稿支援"
+        alert.informativeText = "行いたい処理をチェックで選ぶと、除去→文字種→追加の順に1回でまとめて適用します。"
+            + "文字列を選択しているときは、その範囲だけが対象になります。"
+        alert.accessoryView = container
+        alert.addButton(withTitle: "実行")
+        alert.addButton(withTitle: "キャンセル")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let alphabet: TextTransform.AlphabetMode
+        if alphaFull.state == .on {
+            alphabet = .fullWidth
+        } else if alphaHalf.state == .on {
+            alphabet = .halfWidth
+        } else {
+            alphabet = .keep
+        }
+
+        // 次回も同じ選択から始められるよう覚えておく
+        defaults.set(removeHalf.state == .on, forKey: "assistRemoveHalf")
+        defaults.set(removeFull.state == .on, forKey: "assistRemoveFull")
+        defaults.set(removeTab.state == .on, forKey: "assistRemoveTab")
+        defaults.set(removeIndent.state == .on, forKey: "assistRemoveIndent")
+        defaults.set(digits.state == .on, forKey: "assistDigits")
+        defaults.set(addIndent.state == .on, forKey: "assistAddIndent")
+        defaults.set(addBlank.state == .on, forKey: "assistAddBlank")
+        switch alphabet {
+        case .fullWidth: defaults.set("full", forKey: "assistAlphabet")
+        case .halfWidth: defaults.set("half", forKey: "assistAlphabet")
+        case .keep: defaults.set("keep", forKey: "assistAlphabet")
+        }
+
+        let options = TextTransform.AssistOptions(
+            removeHalfWidthSpace: removeHalf.state == .on,
+            removeFullWidthSpace: removeFull.state == .on,
+            removeTab: removeTab.state == .on,
+            removeLeadingIndent: removeIndent.state == .on,
+            digitsToHalfWidth: digits.state == .on,
+            alphabet: alphabet,
+            addLeadingIndent: addIndent.state == .on,
+            addBlankLines: addBlank.state == .on
+        )
+        // 何も選ばれていなければ何もしない
+        guard options.hasAnyAction else { return }
+        applyTransform { TextTransform.assist($0, options: options) }
+    }
+
+    /// 原稿支援ダイアログの横幅（説明文の折り返し幅もここから決める）
+    private var assistDialogWidth: CGFloat { 380 }
+
+    /// 「すべてオフ」から触るためにダイアログ表示中だけ控えておく。
+    /// モーダルなので同時に2つ開くことはない
+    private static var assistDialogControls: (checks: [NSButton], alphabet: [NSButton])?
+
+    @objc private func assistAllOff(_ sender: Any?) {
+        guard let controls = Document.assistDialogControls else { return }
+        for box in controls.checks { box.state = .off }
+        // アルファベットは先頭の「そのまま」へ戻す
+        for (index, radio) in controls.alphabet.enumerated() {
+            radio.state = index == 0 ? .on : .off
         }
     }
+
+    /// ラジオボタンを排他にするためだけのアクション（値は「実行」時にまとめて読む）
+    @objc private func assistAlphabetChanged(_ sender: NSButton) {}
 
     /// 改行のみの行を1段階ぶん削除する（連続する空行は1回につき1行ずつ詰まる）
     @objc func removeBlankLinesCommand(_ sender: Any?) {
@@ -1473,7 +1653,7 @@ final class Document: NSDocument, NSTextViewDelegate {
             "wrap": { [weak self] in self?.wrapCommand(nil) },
             "removenl": { [weak self] in self?.removeNewlinesCommand(nil) },
             "blankline": { [weak self] in self?.removeBlankLinesCommand(nil) },
-            "removespace": { [weak self] in self?.removeSpacesCommand(nil) },
+            "removespace": { [weak self] in self?.manuscriptAssistCommand(nil) },
             "close": { [weak self] in self?.closeSavingFirst(nil) },
         ]
     }
@@ -1495,7 +1675,7 @@ final class Document: NSDocument, NSTextViewDelegate {
         reading.state = readingMode ? .on : .off
         menu.addItem(.separator())
         menu.addItem(withTitle: "設定…", action: #selector(AppDelegate.showPreferences(_:)), keyEquivalent: "")
-        menu.addItem(withTitle: "使い方", action: #selector(AppDelegate.showShortcutHelp(_:)), keyEquivalent: "")
+        menu.addItem(withTitle: "使い方", action: #selector(AppDelegate.showUserGuide(_:)), keyEquivalent: "")
         // ボタンの真下に出す
         let anchor = bar.overflowAnchor
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: -4), in: anchor)
@@ -1570,6 +1750,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     private weak var saveFolderLabel: NSTextField?
     private weak var historyMenu: NSMenu?
     private var menuEditorController: MenuEditorWindowController?
+    private var helpWindowController: HelpWindowController?
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         UserDefaults.standard.register(defaults: [
@@ -1579,8 +1760,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             "autoSaveInterval": 0.0, // 分。0 で無効（既定はオフ）
             "dateFormat": 0,
             "timeFormat": 0,
-            "removeFullWidthSpace": true, // 「スペース除去」（⌃K）で全角スペースを除去するか
-            "removeHalfWidthSpace": true, // 同、半角スペース
+            "assistAlphabet": "keep", // 原稿支援のアルファベット変換（keep/full/half）
             "noParagraphDetect": false, // ⌃Rの非整形で記号による段落認識をしないか
             "darkMode": "system", // "system"/"light"/"dark"
             "printFontSize": 0.0, // 印刷時の文字サイズ。0で画面表示と同じサイズを使う
@@ -1623,7 +1803,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     @objc func showPreferences(_ sender: Any?) {
         if preferencesPanel == nil {
             let panel = NSPanel(
-                contentRect: NSRect(x: 0, y: 0, width: 460, height: 440),
+                contentRect: NSRect(x: 0, y: 0, width: 460, height: 408),
                 styleMask: [.titled, .closable],
                 backing: .buffered, defer: false)
             panel.title = "設定"
@@ -1703,20 +1883,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             wrapRow.orientation = .horizontal
             wrapRow.spacing = 8
 
-            // --- 「スペース除去」（⌃K）が対象にするスペース ---
-            let spaceRemovalTitle = NSTextField(labelWithString: "「スペース除去」（⌃K）で除去するスペース:")
-            let fullWidthSpaceCheck = NSButton(checkboxWithTitle: "全角スペース（段落の字下げは維持）",
-                                               target: self, action: #selector(toggleRemoveFullWidthSpace(_:)))
-            fullWidthSpaceCheck.state = UserDefaults.standard.bool(forKey: "removeFullWidthSpace") ? .on : .off
-            let halfWidthSpaceCheck = NSButton(checkboxWithTitle: "半角スペース",
-                                               target: self, action: #selector(toggleRemoveHalfWidthSpace(_:)))
-            halfWidthSpaceCheck.state = UserDefaults.standard.bool(forKey: "removeHalfWidthSpace") ? .on : .off
-            let noParagraphCheck = NSButton(checkboxWithTitle: "段落を区別しない（非整形・スペース除去）",
+            // --- 非整形（⌃R）の段落判定 ---
+            // 除去するスペースの指定は「原稿支援」（⌃K）のダイアログへ移した。
+            // 以前はこのpref1つを非整形とスペース除去で共用しており、片方を変えると
+            // もう片方の挙動まで変わっていた
+            let noParagraphCheck = NSButton(checkboxWithTitle: "非整形で段落を区別しない",
                                             target: self, action: #selector(toggleNoParagraphDetect(_:)))
             noParagraphCheck.state = UserDefaults.standard.bool(forKey: "noParagraphDetect") ? .on : .off
-            let spaceRemovalChecksRow = NSStackView(views: [fullWidthSpaceCheck, halfWidthSpaceCheck, noParagraphCheck])
-            spaceRemovalChecksRow.orientation = .horizontal
-            spaceRemovalChecksRow.spacing = 16
+            let noParagraphRow = NSStackView(views: [noParagraphCheck])
+            noParagraphRow.orientation = .horizontal
 
             // --- タブ ---
             let tabsCheck = NSButton(checkboxWithTitle: "ウインドウをタブでまとめる（ファイルが1つの時もタブバーを表示）",
@@ -1822,7 +1997,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             // （設定パネルが長くなりすぎるのを避けるため。2026-07-19、ユーザー指示）。
 
             let stack = NSStackView(views: [
-                folderRow, fontSizeRow, wrapRow, spaceRemovalTitle, spaceRemovalChecksRow,
+                folderRow, fontSizeRow, wrapRow, noParagraphRow,
                 tabsRow,
                 darkModeTitle, darkModeRow,
                 printFontRow, autoSaveRow, dateRow, timeRow, menuEditRow,
@@ -1856,14 +2031,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         for case let document as Document in NSDocumentController.shared.documents {
             document.applyFontSize()
         }
-    }
-
-    @objc private func toggleRemoveFullWidthSpace(_ sender: NSButton) {
-        UserDefaults.standard.set(sender.state == .on, forKey: "removeFullWidthSpace")
-    }
-
-    @objc private func toggleRemoveHalfWidthSpace(_ sender: NSButton) {
-        UserDefaults.standard.set(sender.state == .on, forKey: "removeHalfWidthSpace")
     }
 
     @objc private func toggleNoParagraphDetect(_ sender: NSButton) {
@@ -1954,6 +2121,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    /// アプリ内の「使い方ガイド」を開く。既に開いていれば同じウインドウを前面に出すだけ
+    /// （毎回作り直すと、読んでいた位置が失われるため）
+    @objc func showUserGuide(_ sender: Any?) {
+        if let controller = helpWindowController, let window = controller.window {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        let controller = HelpWindowController()
+        // ドキュメントウインドウと同じく、AppKitに位置をずらされないようにする
+        controller.shouldCascadeWindows = false
+        helpWindowController = controller
+        controller.window?.center()
+        controller.showWindow(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
     /// Ctrl+/ で表示する、現在のキーボードショートカット一覧
     @objc func showShortcutHelp(_ sender: Any?) {
         let text = """
@@ -1971,7 +2155,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             Ctrl+R　非整形
             Ctrl+E　整形
             Ctrl+L　空行除去（連続する空行は1回に1行ずつ）
-            Ctrl+K　スペース除去
+            Ctrl+K　原稿支援
             Ctrl+B　閲覧モードの切替
             Ctrl+;　日付を挿入
             Ctrl+Shift+;　時刻を挿入
@@ -2249,16 +2433,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         blankLineShift.isHidden = true
         blankLineShift.allowsKeyEquivalentWhenHidden = true
 
-        let removeSpace = editMenu.addItem(withTitle: "スペース除去",
-                                           action: #selector(Document.removeSpacesCommand(_:)),
+        let assist = editMenu.addItem(withTitle: "原稿支援…",
+                                      action: #selector(Document.manuscriptAssistCommand(_:)),
+                                      keyEquivalent: "k")
+        assist.keyEquivalentModifierMask = [.control]
+        let assistShift = editMenu.addItem(withTitle: "原稿支援…",
+                                           action: #selector(Document.manuscriptAssistCommand(_:)),
                                            keyEquivalent: "k")
-        removeSpace.keyEquivalentModifierMask = [.control]
-        let removeSpaceShift = editMenu.addItem(withTitle: "スペース除去",
-                                                action: #selector(Document.removeSpacesCommand(_:)),
-                                                keyEquivalent: "k")
-        removeSpaceShift.keyEquivalentModifierMask = [.control, .shift]
-        removeSpaceShift.isHidden = true
-        removeSpaceShift.allowsKeyEquivalentWhenHidden = true
+        assistShift.keyEquivalentModifierMask = [.control, .shift]
+        assistShift.isHidden = true
+        assistShift.allowsKeyEquivalentWhenHidden = true
 
         let dateItem = editMenu.addItem(withTitle: "日付を挿入",
                                         action: #selector(Document.insertDateCommand(_:)),
@@ -2337,10 +2521,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
         // ヘルプ
         let helpMenu = NSMenu(title: "ヘルプ")
+        // ヘルプブックを持たないアプリでは、AppKitがヘルプメニューの「先頭の項目」を
+        // 標準の「◯◯ヘルプ」とみなして実行時に取り除く。そのため先頭には置かない
+        // （先頭に置いた「使い方ガイド」がメニューから消える不具合の原因だった）
         let shortcutHelpItem = helpMenu.addItem(withTitle: "キーボードショートカット一覧",
                                                 action: #selector(AppDelegate.showShortcutHelp(_:)),
                                                 keyEquivalent: "/")
         shortcutHelpItem.keyEquivalentModifierMask = [.control]
+        helpMenu.addItem(withTitle: "使い方ガイド",
+                         action: #selector(AppDelegate.showUserGuide(_:)),
+                         keyEquivalent: "")
         addSubmenu(helpMenu, title: "ヘルプ", to: mainMenu)
         NSApp.helpMenu = helpMenu
 

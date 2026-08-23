@@ -134,9 +134,9 @@ enum TextTransform {
         return out
     }
 
-    /// 全角・半角スペースを行単位で除去する（非整形とあわせて使う「スペース除去」）。
-    /// ただしprotectLeadingIndent=trueの間は、行頭の全角スペース（段落の字下げ）を
-    /// 設定に関わらず常に残す。「段落を区別しない」がオンのときはfalseを渡し、
+    /// 全角・半角スペースを行単位で除去する（原稿支援の除去処理の中核）。
+    /// ただし行頭の全角スペース（段落の字下げ）はprotectLeadingIndent=trueの間は
+    /// 設定に関わらず常に残す。「行頭の字下げも除去する」がオンのときはfalseを渡し、
     /// 行頭の字下げも他の全角スペースと同様に除去できるようにする。
     static func removeSpaces(
         _ text: String,
@@ -145,26 +145,139 @@ enum TextTransform {
         protectLeadingIndent: Bool = true
     ) -> String {
         guard removeFullWidth || removeHalfWidth else { return text }
-        let lines = text.components(separatedBy: "\n")
-        var outLines: [String] = []
-        outLines.reserveCapacity(lines.count)
-        for line in lines {
-            guard !line.isEmpty else {
-                outLines.append(line)
-                continue
-            }
-            let chars = Array(line)
-            let leadingFullWidthSpace = protectLeadingIndent && chars[0] == "\u{3000}"
-            let startIndex = leadingFullWidthSpace ? 1 : 0
-            var kept = leadingFullWidthSpace ? [chars[0]] : []
-            for ch in chars[startIndex...] {
-                if removeFullWidth && ch == "\u{3000}" { continue }
-                if removeHalfWidth && ch == " " { continue }
-                kept.append(ch)
-            }
-            outLines.append(String(kept))
+        return text.components(separatedBy: "\n").map {
+            removeSpacesFromLine($0,
+                                 removeFullWidth: removeFullWidth,
+                                 removeHalfWidth: removeHalfWidth,
+                                 protectLeadingIndent: protectLeadingIndent)
+        }.joined(separator: "\n")
+    }
+
+    /// removeSpacesの1行ぶん。原稿支援（assist）からも使う
+    private static func removeSpacesFromLine(
+        _ line: String,
+        removeFullWidth: Bool,
+        removeHalfWidth: Bool,
+        protectLeadingIndent: Bool
+    ) -> String {
+        guard !line.isEmpty else { return line }
+        let chars = Array(line)
+        let leadingFullWidthSpace = protectLeadingIndent && chars[0] == "\u{3000}"
+        var kept: [Character] = leadingFullWidthSpace ? [chars[0]] : []
+        kept.reserveCapacity(chars.count)
+        for ch in chars[(leadingFullWidthSpace ? 1 : 0)...] {
+            if removeFullWidth && ch == "\u{3000}" { continue }
+            if removeHalfWidth && ch == " " { continue }
+            kept.append(ch)
         }
-        return outLines.joined(separator: "\n")
+        return String(kept)
+    }
+
+    // ---------- 原稿支援 ----------
+
+    /// 原稿支援のアルファベット変換
+    enum AlphabetMode {
+        case keep, fullWidth, halfWidth
+    }
+
+    /// 原稿支援（ダイアログで選んだ内容を1回でまとめて適用する）の設定。
+    /// 何も選ばれていなければ何もしない。
+    struct AssistOptions {
+        var removeHalfWidthSpace = false
+        var removeFullWidthSpace = false
+        var removeTab = false
+        /// 行頭の全角スペース（一字下げ）も除去するか。falseなら字下げは残す
+        var removeLeadingIndent = false
+        var digitsToHalfWidth = false
+        var alphabet: AlphabetMode = .keep
+        var addLeadingIndent = false
+        /// すべての改行の直後に空行を入れる（段落の間を1行あけてWeb記事向けに読みやすくする）
+        var addBlankLines = false
+
+        var hasAnyAction: Bool {
+            removeHalfWidthSpace || removeFullWidthSpace || removeTab
+                || digitsToHalfWidth || alphabet != .keep
+                || addLeadingIndent || addBlankLines
+        }
+    }
+
+    /// 原稿支援。除去 → 文字種の変換 → 追加 の順に、1回の走査でまとめて適用する。
+    /// この順序には意味があり、「行頭スペースをいったん除去してから規則正しく付け直す」
+    /// というバラバラの字下げを整える手順が、そのまま1回の実行で行える。
+    static func assist(_ text: String, options: AssistOptions) -> String {
+        guard options.hasAnyAction else { return text }
+        var result = text.components(separatedBy: "\n")
+            .map { assistLine($0, options) }
+            .joined(separator: "\n")
+        // 空行の挿入だけは行単位ではなく全体に対して行う（行を増やす処理のため）。
+        // 一字下げや会話文かどうかは見ずに、すべての改行の直後へ機械的に1行入れる。
+        // 段落の判定に頼ると、一字下げをしないWeb向けの文章や「で始まる会話文で
+        // 効いたり効かなかったりするため、結果が読める単純な規則にしている
+        if options.addBlankLines {
+            result = result.replacingOccurrences(of: "\n", with: "\n\n")
+        }
+        return result
+    }
+
+    private static func assistLine(_ raw: String, _ o: AssistOptions) -> String {
+        var line = raw
+
+        // ① タブ。行頭のタブは字下げのつもりで入っていることが多いので全角スペース1つに
+        //    変換し、行中のタブは取り除く（変換後の全角スペースは、このあとの②で
+        //    「行頭の字下げも除去する」が選ばれていれば一緒に消える）
+        if o.removeTab && line.contains("\t") {
+            let leadingTabs = line.prefix(while: { $0 == "\t" }).count
+            let rest = String(line.dropFirst(leadingTabs))
+                .replacingOccurrences(of: "\t", with: "")
+            line = leadingTabs > 0 ? "\u{3000}" + rest : rest
+        }
+
+        // ② スペースの除去
+        if o.removeHalfWidthSpace || o.removeFullWidthSpace {
+            line = removeSpacesFromLine(line,
+                                        removeFullWidth: o.removeFullWidthSpace,
+                                        removeHalfWidth: o.removeHalfWidthSpace,
+                                        protectLeadingIndent: !o.removeLeadingIndent)
+        }
+
+        // ③ 文字種の変換（全角と半角は0xFEE0だけ離れている）
+        if o.digitsToHalfWidth || o.alphabet != .keep {
+            line = String(line.map { convertWidth($0, o) })
+        }
+
+        // ④ 行頭の字下げを追加。空行は対象外。会話文のカッコ・箇条書き記号・丸付き数字で
+        //    始まる行と、すでに字下げ済みの行にも足さない（isParagraphHeadがすべて含む）
+        if o.addLeadingIndent, let first = line.first, !isParagraphHead(first) {
+            line = "\u{3000}" + line
+        }
+        return line
+    }
+
+    /// 数字・アルファベットの全角／半角を1文字ぶん変換する
+    private static func convertWidth(_ ch: Character, _ o: AssistOptions) -> Character {
+        guard ch.unicodeScalars.count == 1, let value = ch.unicodeScalars.first?.value else { return ch }
+        if o.digitsToHalfWidth, (0xFF10...0xFF19).contains(value) {
+            return shifted(ch, by: -0xFEE0)
+        }
+        switch o.alphabet {
+        case .halfWidth:
+            if (0xFF21...0xFF3A).contains(value) || (0xFF41...0xFF5A).contains(value) {
+                return shifted(ch, by: -0xFEE0)
+            }
+        case .fullWidth:
+            if (0x41...0x5A).contains(value) || (0x61...0x7A).contains(value) {
+                return shifted(ch, by: 0xFEE0)
+            }
+        case .keep:
+            break
+        }
+        return ch
+    }
+
+    private static func shifted(_ ch: Character, by delta: Int) -> Character {
+        guard let value = ch.unicodeScalars.first?.value,
+              let scalar = Unicode.Scalar(UInt32(Int(value) + delta)) else { return ch }
+        return Character(scalar)
     }
 
     /// 行頭に来ると読みにくい（行頭禁則）文字。整形（wrap）で改行を

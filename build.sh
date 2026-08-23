@@ -16,6 +16,7 @@ swiftc -O \
     -target arm64-apple-macos12.0 \
     -o "$BUNDLE/Contents/MacOS/$APP_NAME.arm64" \
     Sources/TextLogic.swift \
+    Sources/HelpContent.swift \
     Sources/DocumentSafety.swift \
     Sources/ToolbarMenu.swift \
     Sources/SearchMatchList.swift \
@@ -25,6 +26,7 @@ swiftc -O \
     -target x86_64-apple-macos12.0 \
     -o "$BUNDLE/Contents/MacOS/$APP_NAME.x86_64" \
     Sources/TextLogic.swift \
+    Sources/HelpContent.swift \
     Sources/DocumentSafety.swift \
     Sources/ToolbarMenu.swift \
     Sources/SearchMatchList.swift \

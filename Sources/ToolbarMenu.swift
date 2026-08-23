@@ -77,7 +77,9 @@ final class MenuBarView: NSView {
         ("wrap", "整形"),
         ("removenl", "非整形"),
         ("blankline", "空行除去"),
-        ("removespace", "スペース除去"),
+        // キーは "removespace" のまま据え置き。変えるとユーザーが保存した並び順から
+        // 外れて末尾へ飛ぶため、ラベルと中身だけを差し替えている
+        ("removespace", "原稿支援"),
         ("close", "閉じる"),
     ]
 

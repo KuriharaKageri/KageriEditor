@@ -65,6 +65,88 @@ check("空行はそのまま",
       TextTransform.removeSpaces("一行目\n\n三行目", removeFullWidth: true, removeHalfWidth: true),
       "一行目\n\n三行目")
 
+// ---- 原稿支援 ----
+func assist(_ text: String, _ o: TextTransform.AssistOptions) -> String {
+    TextTransform.assist(text, options: o)
+}
+
+check("支援_何も選ばなければ変化しない",
+      assist("あ い　う", TextTransform.AssistOptions()),
+      "あ い　う")
+check("支援_半角スペースだけ除去",
+      assist("あ い　う", TextTransform.AssistOptions(removeHalfWidthSpace: true)),
+      "あい　う")
+// 行頭の全角スペース（字下げ）は既定では残る
+check("支援_全角スペース除去でも行頭の字下げは残る",
+      assist("\u{3000}あい　う", TextTransform.AssistOptions(removeFullWidthSpace: true)),
+      "\u{3000}あいう")
+check("支援_行頭の字下げも除去するを選べば消える",
+      assist("\u{3000}あい　う",
+             TextTransform.AssistOptions(removeFullWidthSpace: true, removeLeadingIndent: true)),
+      "あいう")
+// 行頭タブは字下げとみなして全角スペースへ、行中タブは除去
+check("支援_行頭タブは全角スペースになり行中タブは消える",
+      assist("\tあい\tう", TextTransform.AssistOptions(removeTab: true)),
+      "\u{3000}あいう")
+// 行頭タブ→全角スペースにした上で、字下げも除去するなら消える
+check("支援_行頭タブ変換後に字下げ除去も効く",
+      assist("\tあい\tう",
+             TextTransform.AssistOptions(removeFullWidthSpace: true, removeTab: true,
+                                         removeLeadingIndent: true)),
+      "あいう")
+check("支援_数字を半角に",
+      assist("２０２６年３月１日", TextTransform.AssistOptions(digitsToHalfWidth: true)),
+      "2026年3月1日")
+check("支援_アルファベットを半角に",
+      assist("ＫａｇｅｒｉＥｄｉｔｏｒ", TextTransform.AssistOptions(alphabet: .halfWidth)),
+      "KageriEditor")
+check("支援_アルファベットを全角に",
+      assist("ABC", TextTransform.AssistOptions(alphabet: .fullWidth)),
+      "ＡＢＣ")
+check("支援_数字とアルファベットは同時に変換できる",
+      assist("ＡＢＣ１２３",
+             TextTransform.AssistOptions(digitsToHalfWidth: true, alphabet: .halfWidth)),
+      "ABC123")
+check("支援_行頭に字下げを追加",
+      assist("あいう\nかきく", TextTransform.AssistOptions(addLeadingIndent: true)),
+      "\u{3000}あいう\n\u{3000}かきく")
+check("支援_空行には字下げを追加しない",
+      assist("あいう\n\nかきく", TextTransform.AssistOptions(addLeadingIndent: true)),
+      "\u{3000}あいう\n\n\u{3000}かきく")
+check("支援_カッコで始まる会話文には字下げを追加しない",
+      assist("あいう\n「そうですね」\n」と続く", TextTransform.AssistOptions(addLeadingIndent: true)),
+      "\u{3000}あいう\n「そうですね」\n」と続く")
+check("支援_箇条書きや丸付き数字にも字下げを追加しない",
+      assist("・りんご\n①手順\n本文", TextTransform.AssistOptions(addLeadingIndent: true)),
+      "・りんご\n①手順\n\u{3000}本文")
+check("支援_すでに字下げ済みの行を二重に下げない",
+      assist("\u{3000}あいう", TextTransform.AssistOptions(addLeadingIndent: true)),
+      "\u{3000}あいう")
+check("支援_すべての改行の直後に空行を入れる",
+      assist("あ\nい\nう", TextTransform.AssistOptions(addBlankLines: true)),
+      "あ\n\nい\n\nう")
+// 一字下げのない行も会話文も、区別せず一律に1行あける
+check("支援_空行追加は段落の判定をしない",
+      assist("あ\n「い」\n\u{3000}う", TextTransform.AssistOptions(addBlankLines: true)),
+      "あ\n\n「い」\n\n\u{3000}う")
+// 既に空行がある箇所も同じ規則で処理する（改行の数だけ増える）
+check("支援_既存の空行も同様に増える",
+      assist("あ\n\nい", TextTransform.AssistOptions(addBlankLines: true)),
+      "あ\n\n\n\nい")
+check("支援_改行がなければ空行は増えない",
+      assist("あいう", TextTransform.AssistOptions(addBlankLines: true)),
+      "あいう")
+// 字下げを付けてから空行を入れる（空行に字下げが入らない）
+check("支援_字下げ追加と空行追加を同時に使える",
+      assist("あ\nい", TextTransform.AssistOptions(addLeadingIndent: true, addBlankLines: true)),
+      "\u{3000}あ\n\n\u{3000}い")
+// 除去→追加の順に走るので、バラバラの字下げを一度で揃えられる
+check("支援_字下げを除去してから付け直せる",
+      assist("\u{3000}\u{3000}あいう\nかきく",
+             TextTransform.AssistOptions(removeFullWidthSpace: true, removeLeadingIndent: true,
+                                         addLeadingIndent: true)),
+      "\u{3000}あいう\n\u{3000}かきく")
+
 // ---- 指定文字数で改行 ----
 check("全角10字で折り返し",
       TextTransform.wrap("あいうえおかきくけこさしすせそ", limit: 10),
