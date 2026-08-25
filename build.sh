@@ -17,6 +17,10 @@ swiftc -O \
     -o "$BUNDLE/Contents/MacOS/$APP_NAME.arm64" \
     Sources/TextLogic.swift \
     Sources/HelpContent.swift \
+    Sources/ProofCheck.swift \
+    Sources/Outline.swift \
+    Sources/ProofListWindow.swift \
+    Sources/OutlineWindow.swift \
     Sources/DocumentSafety.swift \
     Sources/ToolbarMenu.swift \
     Sources/SearchMatchList.swift \
@@ -27,6 +31,10 @@ swiftc -O \
     -o "$BUNDLE/Contents/MacOS/$APP_NAME.x86_64" \
     Sources/TextLogic.swift \
     Sources/HelpContent.swift \
+    Sources/ProofCheck.swift \
+    Sources/Outline.swift \
+    Sources/ProofListWindow.swift \
+    Sources/OutlineWindow.swift \
     Sources/DocumentSafety.swift \
     Sources/ToolbarMenu.swift \
     Sources/SearchMatchList.swift \

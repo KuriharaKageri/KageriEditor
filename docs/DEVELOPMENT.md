@@ -31,6 +31,20 @@ swiftc -o "$TEST_DIR/run_tests" Sources/TextLogic.swift "$TEST_DIR/main.swift"
 
 `make_dist.sh` はこのテストを最初に実行し、失敗したら配布物を作らずに中断します。
 
+## バージョンの付け方
+
+検証中の版は、末尾に小文字を付けて見分けます（`2.16a` → `2.16b` → …）。
+
+- Mac は `Info.plist` の `CFBundleShortVersionString` の1か所。`make_dist.sh` が
+  そこから `dist/KageriEditor-<バージョン>.zip` の名前を作ります
+- Android は `app/build.gradle.kts` の `versionName` の1か所。Debug ビルドには
+  `versionNameSuffix = "-debug"` が付くので `2.16a-debug` と表示されます。
+  APK は `apk/KageriEditor-<バージョン>-debug.apk` の名前で置きます
+
+**同じ番号の APK が何本もできると、古いものを入れて「直っていない」と誤診します**
+（実際に一度やりました）。中身を変えたら文字を進めてください。
+公開するときは文字を外し、`versionCode` も上げます。
+
 ## 配布
 
 ```sh
@@ -69,6 +83,7 @@ swiftc -o "$TEST_DIR/run_tests" Sources/TextLogic.swift "$TEST_DIR/main.swift"
 | 検索 / 検索と置換 / 検索結果一覧 | ⌃F（⌘F）/ ⌘⌥F / ⌘⇧F |
 | 非整形 / 整形 | ⌃R / ⌃E |
 | 空行除去 / 原稿支援 | ⌃L / ⌃K |
+| 推敲 / 見出し | ⌃J / ⌃U |
 | 閲覧モードの切替 | ⌃B |
 | 日付 / 時刻を挿入 | ⌃; / ⌃⇧; |
 | 設定 | ⌃I（⌘,） |
@@ -216,6 +231,15 @@ AppKitが表示直前に枠を右下へずらすため、上で決めた位置�
 
 - `Sources/TextLogic.swift` — 全角換算カウント・原稿用紙換算・整形／非整形・空行除去・
   原稿支援・選択範囲の行単位への拡張・ファイル名生成の純粋ロジック（テスト対象）
+- 一覧パネル（検索結果一覧・推敲・見出し）の文字サイズは `ListAppearance`（`SearchMatchList.swift`）
+  に集約しています。設定の `listFontSize`（既定12）を読み、行の高さもそこから求めます。
+  本文の `fontSize` とは別に持つのは、一覧が補助的な表示で、本文と同じ大きさだと場所を取りすぎるためです。
+  `UserDefaults.didChangeNotification` を各パネルが購読しているので、開いたままでもすぐ反映されます。
+
+- `Sources/ProofCheck.swift` — 推敲の判定（UIを知らない純粋ロジック。Android版と同一の仕様）
+- `Sources/Outline.swift` — 単位の定義（`Units`）と見出しの判定（`Outline`）
+- `Sources/ProofListWindow.swift` — 推敲の一覧パネル
+- `Sources/OutlineWindow.swift` — 見出しの一覧パネル
 - `Sources/HelpContent.swift` — アプリ内「使い方ガイド」の全文（`HelpContent.sections`）と、
   それを表示するウインドウ（`HelpWindowController`）
 - `Sources/main.swift` — エディタ本体（NSDocument / NSTextView / 行番号ルーラー /

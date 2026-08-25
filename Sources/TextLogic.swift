@@ -18,6 +18,22 @@ enum CharWidth {
         0x00D7, // ×
     ]
 
+    /// 幅を持たない書式制御文字（ゼロ幅空白・単語結合子・BOMなど）。
+    ///
+    /// ウェブから貼ると混ざることがある。**目に見えず幅も持たないので0字**として数える
+    /// （以前は半角1つぶんとして数えていて、字数が実際より多く出ていた）。
+    /// カーソルの位置だけは1つ占めるので、見た目と操作が食い違う原因にもなる。
+    static func isZeroWidth(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.value {
+        case 0x00AD, 0xFEFF: return true          // ソフトハイフン、BOM
+        case 0x200B...0x200F: return true         // ゼロ幅空白・接合子・方向指定
+        case 0x202A...0x202E: return true         // 方向の埋め込み
+        case 0x2060...0x206F: return true         // 単語結合子ほか
+        case 0xFFF9...0xFFFB: return true         // ルビの区切り
+        default: return false
+        }
+    }
+
     static func isFullWidth(_ scalar: Unicode.Scalar) -> Bool {
         switch scalar.value {
         case 0x1100...0x115F,   // ハングル字母
@@ -42,7 +58,94 @@ enum CharWidth {
 
     static func width(of ch: Character) -> Double {
         guard let s = ch.unicodeScalars.first else { return 0.5 }
+        if isZeroWidth(s) { return 0.0 }
         return isFullWidth(s) ? 1.0 : 0.5
+    }
+
+    /// 全角換算の字数と、400字詰め原稿用紙の行数を**1回の走査で**まとめて求める。
+    ///
+    /// 以前は zenkakuCount と manuscriptSheets を別々に呼んでいたため、
+    /// 打鍵のたびに全文を3回走査し、さらに manuscriptLines の
+    /// components(separatedBy:) が全行を配列に確保していた。
+    /// 34万字・540万字といった文書では、これだけで入力が追いつかなくなる。
+    /// （Android版2.15の CharWidth.measure と同じ考え方）
+    struct Metrics {
+        let zenkaku: Double
+        let manuscriptLines: Int
+        /// 数から除いた見出しの印の文字数（excludeHeadingMarks が false のときは0）
+        var marks: Int = 0
+    }
+
+    /// 行頭にある見出しの印の長さ。印でなければ0。
+    ///
+    /// 印は半角の「# 」「## 」の2段だけ。「###」以上は印ではない。
+    /// 全角の「＃」も印にしない（印はボタンで入れるので、書き手が打ち分けに迷うことはない）。
+    /// 印は原稿ではなく書き手の道具なので、字数・原稿用紙換算からは除く。
+    static func headingMarkLength(_ chars: [Character], _ lineStart: Int) -> Int {
+        guard lineStart < chars.count, chars[lineStart] == "#" else { return 0 }
+        var i = lineStart + 1
+        if i < chars.count, chars[i] == "#" { i += 1 }
+        guard i < chars.count, chars[i] == " " else { return 0 }
+        return i - lineStart + 1
+    }
+
+    static func measure(
+        _ text: String, charsPerLine: Int = 20, excludeHeadingMarks: Bool = false
+    ) -> Metrics {
+        var total = 0.0
+        var lineWidth = 0.0
+        var lines = 0
+        var marks = 0
+        // 印は行頭にあるものだけが印なので、行の先頭かどうかを持ち回る。
+        // 「#」を見た時点ではまだ印か分からないので、後ろの空白まで見てから決める
+        var atLineStart = true
+        var pendingHashes = 0
+        let hashWidth = width(of: "#")
+
+        func flushHashes() {
+            guard pendingHashes > 0 else { return }
+            let w = hashWidth * Double(pendingHashes)
+            total += w
+            lineWidth += w
+            pendingHashes = 0
+        }
+
+        for ch in text {
+            if excludeHeadingMarks {
+                if atLineStart, ch == "#" {
+                    pendingHashes = 1
+                    atLineStart = false
+                    continue
+                }
+                if pendingHashes == 1, ch == "#" {
+                    pendingHashes = 2
+                    continue
+                }
+                if pendingHashes > 0 {
+                    if ch == " " {
+                        marks += pendingHashes + 1
+                        pendingHashes = 0
+                        continue
+                    }
+                    flushHashes() // 印ではなかったので、ためていた「#」を数え直す
+                }
+                atLineStart = false
+            }
+            if ch == "\n" {
+                // 段落の途中で改行すると行末の余白もマスを消費する（空行も1行）
+                lines += max(1, Int((lineWidth / Double(charsPerLine)).rounded(.up)))
+                lineWidth = 0
+                atLineStart = true
+                continue
+            }
+            if ch == "\r" { continue }
+            let w = width(of: ch)
+            total += w
+            lineWidth += w
+        }
+        flushHashes()
+        lines += max(1, Int((lineWidth / Double(charsPerLine)).rounded(.up))) // 最後の行
+        return Metrics(zenkaku: total, manuscriptLines: lines, marks: marks)
     }
 
     /// 改行を除いた全角換算の文字数
@@ -58,18 +161,23 @@ enum CharWidth {
     /// 400字詰め原稿用紙（20字×20行）に換算した行数。
     /// 出版の慣例にならい、段落の途中で改行すると行末の余白もマスとして消費する
     /// （1段落は20字ごとに1行を使い、空行も1行として数える）。
-    static func manuscriptLines(_ text: String, charsPerLine: Int = 20) -> Int {
-        var lines = 0
-        for line in text.components(separatedBy: "\n") {
-            lines += max(1, Int((zenkakuCount(line) / Double(charsPerLine)).rounded(.up)))
-        }
-        return lines
+    /// measure に通す（以前は components(separatedBy:) で全行を配列に確保していた）
+    static func manuscriptLines(
+        _ text: String, charsPerLine: Int = 20, excludeHeadingMarks: Bool = false
+    ) -> Int {
+        measure(text, charsPerLine: charsPerLine, excludeHeadingMarks: excludeHeadingMarks)
+            .manuscriptLines
     }
 
     /// 400字詰め原稿用紙の換算枚数。端数は小数第1位までで切り捨てるので、
     /// 「1枚」と表示されていれば本当に1枚分書けている。
-    static func manuscriptSheets(_ text: String, charsPerLine: Int = 20, linesPerSheet: Int = 20) -> Double {
-        let sheets = Double(manuscriptLines(text, charsPerLine: charsPerLine)) / Double(linesPerSheet)
+    static func manuscriptSheets(
+        _ text: String, charsPerLine: Int = 20, linesPerSheet: Int = 20,
+        excludeHeadingMarks: Bool = false
+    ) -> Double {
+        let lines = manuscriptLines(
+            text, charsPerLine: charsPerLine, excludeHeadingMarks: excludeHeadingMarks)
+        let sheets = Double(lines) / Double(linesPerSheet)
         return (sheets * 10).rounded(.down) / 10
     }
 }
@@ -87,7 +195,39 @@ enum TextTransform {
         "［", "］", "[", "]", "｛", "｝", "{", "}",
         "〝", "〟", "“", "”", "‘", "’", "\"", "'", "＂", "＇",
         "・", "･", "●", "○", "◎", "■", "□", "◆", "◇",
+        // 箇条書き・注記の印。行頭に置かれたものは本文であって見出しではない
+        "*", "＊", "※", "-", "－",
+        // ダッシュ。会話や強調で段落の先頭に置かれる
+        "―", "—", "–",
+        "#", // 見出しの印
     ]
+
+    /// 日本語（ひらがな・カタカナ・漢字）が1文字でも入っている行か。
+    ///
+    /// 一字下げは日本語の段落の作法なので、英文の行には足さない。
+    /// **「行頭が英字か」ではなく「行に日本語があるか」で見る。**
+    /// そうしないと「iPadは便利だ」のように英単語で始まる日本語の段落まで
+    /// 字下げされなくなる。
+    static func containsJapanese(_ line: String) -> Bool {
+        line.unicodeScalars.contains { u in
+            switch u.value {
+            case 0x3041...0x309F: return true   // ひらがな
+            case 0x30A0...0x30FF: return true   // カタカナ
+            case 0x4E00...0x9FFF: return true   // 漢字
+            case 0x3400...0x4DBF: return true   // 漢字（拡張A）
+            case 0x3005: return true            // 々
+            case 0xFF66...0xFF9D: return true   // 半角カタカナ
+            default: return false
+            }
+        }
+    }
+
+    /// 見出しの印（「# 」「## 」）で始まる行かどうか。
+    /// 整形・非整形は、この行に手を触れない
+    static func isHeadingLine(_ line: String) -> Bool {
+        let chars = Array(line.prefix(3))
+        return CharWidth.headingMarkLength(chars, 0) > 0
+    }
 
     /// 行頭にあると「段落の先頭」とみなす文字かどうか。
     /// 上記の集合に加えて、①②…㊿ などの丸付き数字類も対象。
@@ -118,9 +258,16 @@ enum TextTransform {
         for i in lines.indices {
             let line = lines[i]
             if i > 0 {
-                let prevEmpty = lines[i - 1].isEmpty
+                // 空白だけの行も空行として扱う。書き手には空行に見えるので、
+                // 次の行に吸収されると「勝手に詰められた」ことになる
+                let prevEmpty = lines[i - 1].trimmingCharacters(in: .whitespaces).isEmpty
                 let keep: Bool
-                if line.isEmpty || prevEmpty {
+                if line.trimmingCharacters(in: .whitespaces).isEmpty || prevEmpty {
+                    keep = true
+                } else if isHeadingLine(line) || isHeadingLine(lines[i - 1]) {
+                    // **見出し行は前後の改行を必ず残す。**
+                    // 行頭の記号だけを見ていると、見出しの「後ろ」の改行を守れない。
+                    // 次の行が字下げされていない本文だと、見出しが飲み込まれてしまう
                     keep = true
                 } else if recognizeParagraphs, let first = line.first, isParagraphHead(first) {
                     keep = true
@@ -154,6 +301,28 @@ enum TextTransform {
     }
 
     /// removeSpacesの1行ぶん。原稿支援（assist）からも使う
+    /// 半角スペースと同じ扱いにする見えない空白。
+    /// ウェブから貼ると混ざるが、見た目は空白なのに `U+0020` ではないので
+    /// 「半角スペースを除去」で消えず、書き手には**消せない空白**に見える。
+    /// 半角の英数字・記号（空白を除く印字可能なASCII）。
+    /// 英文の中の空白を守るために、半角スペースの前後を見るのに使う。
+    private static func isAsciiVisible(_ ch: Character) -> Bool {
+        guard let v = ch.unicodeScalars.first?.value, ch.unicodeScalars.count == 1 else {
+            return false
+        }
+        return (0x21...0x7E).contains(v)
+    }
+
+    private static func isInvisibleSpace(_ ch: Character) -> Bool {
+        guard let v = ch.unicodeScalars.first?.value else { return false }
+        switch v {
+        case 0x00A0: return true            // 改行しない空白
+        case 0x2000...0x200A: return true   // 各種の幅の空白
+        case 0x202F, 0x205F: return true    // 狭い改行しない空白、数式用の空白
+        default: return false
+        }
+    }
+
     private static func removeSpacesFromLine(
         _ line: String,
         removeFullWidth: Bool,
@@ -162,12 +331,36 @@ enum TextTransform {
     ) -> String {
         guard !line.isEmpty else { return line }
         let chars = Array(line)
-        let leadingFullWidthSpace = protectLeadingIndent && chars[0] == "\u{3000}"
-        var kept: [Character] = leadingFullWidthSpace ? [chars[0]] : []
+        // **見出しの印は除去の対象にしない。**「# 」の後ろは半角スペースなので、
+        // 「半角スペースを除去」で一緒に消えると印が壊れ、目次も並べ替えも失われる。
+        // 印は原稿ではなく書き手の道具なので、原稿の体裁を整える処理は触らない
+        let markLen = CharWidth.headingMarkLength(chars, 0)
+        let leadingFullWidthSpace =
+            markLen == 0 && protectLeadingIndent && chars[0] == "\u{3000}"
+        var kept: [Character] = markLen > 0
+            ? Array(chars[0..<markLen])
+            : (leadingFullWidthSpace ? [chars[0]] : [])
         kept.reserveCapacity(chars.count)
-        for ch in chars[(leadingFullWidthSpace ? 1 : 0)...] {
+        for index in max(markLen, leadingFullWidthSpace ? 1 : 0)..<chars.count {
+            let ch = chars[index]
             if removeFullWidth && ch == "\u{3000}" { continue }
-            if removeHalfWidth && ch == " " { continue }
+            if removeHalfWidth {
+                // **英文の中の空白は残す。**
+                // この項目を使うのは、OCRやウェブから来た日本語に混じった
+                // 余分な空白を掃除するため。英単語の「間」を詰めたい場面は無い。
+                // 前後がどちらも半角の英数字・記号なら英文の一部とみなす
+                // （「rule of law」は残り、「ICC の判断」は消える）
+                if ch == " " {
+                    let prev = index > 0 ? chars[index - 1] : "\n"
+                    let next = index + 1 < chars.count ? chars[index + 1] : "\n"
+                    if isAsciiVisible(prev) && isAsciiVisible(next) { kept.append(ch) }
+                    continue
+                }
+                // 見えない空白と幅ゼロの文字も、半角スペースと一緒に消す。
+                // 書き手が意図して入れることはまずなく、放っておくと消せない
+                if isInvisibleSpace(ch) { continue }
+                if let v = ch.unicodeScalars.first, CharWidth.isZeroWidth(v) { continue }
+            }
             kept.append(ch)
         }
         return String(kept)
@@ -190,13 +383,17 @@ enum TextTransform {
         var removeLeadingIndent = false
         var digitsToHalfWidth = false
         var alphabet: AlphabetMode = .keep
+        /// 単位（km・L など）だけを半角にする。
+        /// アルファベットを一律に変換すると「単語は全角・単位は半角」という
+        /// 使い分けができないので、単位だけを狙えるように分けている
+        var unitsToHalfWidth = false
         var addLeadingIndent = false
         /// すべての改行の直後に空行を入れる（段落の間を1行あけてWeb記事向けに読みやすくする）
         var addBlankLines = false
 
         var hasAnyAction: Bool {
             removeHalfWidthSpace || removeFullWidthSpace || removeTab
-                || digitsToHalfWidth || alphabet != .keep
+                || digitsToHalfWidth || alphabet != .keep || unitsToHalfWidth
                 || addLeadingIndent || addBlankLines
         }
     }
@@ -220,6 +417,16 @@ enum TextTransform {
     }
 
     private static func assistLine(_ raw: String, _ o: AssistOptions) -> String {
+        // ⓪ 空白だけの行は、行頭の字下げを残す設定でも丸ごと空にする。
+        //    そうしないと「行頭の全角スペース＝段落の字下げ」とみなされて1つだけ残り、
+        //    見た目は空行なのに空行ではない、という行ができてしまう
+        //    （空行除去でも消えず、非整形でも段落の先頭と誤認される）。
+        //    もともと文字が無い行なので、どの空白を残すかを選ぶ意味がない
+        if !raw.isEmpty, raw.allSatisfy({ $0 == " " || $0 == "\u{3000}" || $0 == "\t" }) {
+            let removingAnySpace = o.removeHalfWidthSpace || o.removeFullWidthSpace || o.removeTab
+            return removingAnySpace ? "" : raw
+        }
+
         var line = raw
 
         // ① タブ。行頭のタブは字下げのつもりで入っていることが多いので全角スペース1つに
@@ -245,12 +452,38 @@ enum TextTransform {
             line = String(line.map { convertWidth($0, o) })
         }
 
+        // ③\' 単位だけを半角に。アルファベットの一律変換のあとに行うので、
+        //     「アルファベットを全角に」と同時に選んでも単位は半角のまま残る
+        if o.unitsToHalfWidth { line = unitsToHalfWidth(line) }
+
         // ④ 行頭の字下げを追加。空行は対象外。会話文のカッコ・箇条書き記号・丸付き数字で
-        //    始まる行と、すでに字下げ済みの行にも足さない（isParagraphHeadがすべて含む）
-        if o.addLeadingIndent, let first = line.first, !isParagraphHead(first) {
+        //    始まる行と、すでに字下げ済みの行にも足さない（isParagraphHeadがすべて含む）。
+        //    **英文の行にも足さない**（一字下げは日本語の段落の作法なので）
+        if o.addLeadingIndent, let first = line.first, !isParagraphHead(first),
+           containsJapanese(line) {
             line = "\u{3000}" + line
         }
         return line
+    }
+
+    /// 数字のすぐ後ろに来た単位（ｋｍ→km、Ｌ→L）だけを半角にする。
+    /// 「km/h」のように単位が斜線でつながる場合も、斜線の後ろを単位とみなす。
+    /// アルファベットを一律に変換しないので、「単語は全角・単位は半角」という
+    /// 媒体の決まりに合わせられる
+    static func unitsToHalfWidth(_ line: String) -> String {
+        let chars = Array(line)
+        var out = ""
+        var i = 0
+        while i < chars.count {
+            if let range = Units.unitRange(chars, at: i) {
+                out += Units.toHalfWidth(String(chars[range]))
+                i = range.upperBound
+            } else {
+                out.append(chars[i])
+                i += 1
+            }
+        }
+        return out
     }
 
     /// 数字・アルファベットの全角／半角を1文字ぶん変換する
@@ -325,11 +558,34 @@ enum TextTransform {
         var out = ""
         var acc = 0.0
         var hangCount = 0
+        // 見出し行はそのまま出す。折り返すと後半が独立した行になり、
+        // 見出しが切れて本文が1行増えてしまう
+        var atLineStart = true
+        var hashRun = 0
+        var inHeading = false
         for ch in text {
             if ch == "\n" {
                 out.append(ch)
                 acc = 0
                 hangCount = 0
+                atLineStart = true
+                hashRun = 0
+                inHeading = false
+                continue
+            }
+            if atLineStart {
+                atLineStart = false
+                hashRun = ch == "#" ? 1 : 0
+            } else if hashRun >= 1, ch == "#", hashRun < 2 {
+                hashRun = 2
+            } else if hashRun >= 1, ch == " " {
+                inHeading = true
+                hashRun = 0
+            } else {
+                hashRun = 0
+            }
+            if inHeading {
+                out.append(ch)
                 continue
             }
             let w = CharWidth.width(of: ch)
@@ -360,8 +616,14 @@ enum FileNaming {
     /// 空白だけの行）の場合は、それらを読み飛ばして最初に文字がある行を
     /// 使う。文字がある行が一つもなければ「無題」。
     static func fileName(fromFirstLineOf text: String, maxZenkaku: Double = 20) -> String {
-        let lines = text.components(separatedBy: "\n")
-        let candidate = lines.first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) ?? ""
+        // 見出しの印は原稿ではないので、ファイル名にも入れない。
+        // 印を外した中身が空の行（「# 」まで打った行）は飛ばして次の行を見る
+        let candidate = text.components(separatedBy: "\n").lazy
+            .map { line -> String in
+                let chars = Array(line)
+                return String(chars.dropFirst(CharWidth.headingMarkLength(chars, 0)))
+            }
+            .first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) ?? ""
         var name = ""
         var acc = 0.0
         for ch in candidate {
@@ -375,6 +637,9 @@ enum FileNaming {
         name = name
             .replacingOccurrences(of: "/", with: "／")
             .replacingOccurrences(of: ":", with: "：")
+            // 「#」はURLの断片の区切りなので、ファイルの場所を表す文字列に混ざると
+            // そこから後ろを切り落とされる。ファイル名には入れない
+            .replacingOccurrences(of: "#", with: "＃")
         // 制御文字を除去
         name = String(name.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) })
         name = name.trimmingCharacters(in: .whitespaces)

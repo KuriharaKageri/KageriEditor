@@ -12,7 +12,7 @@ ZIP_PATH="dist/KageriEditor-${VERSION}.zip"
 echo "── テストを実行 ──"
 TEST_DIR=$(mktemp -d)
 cp Tests/test.swift "$TEST_DIR/main.swift"
-swiftc -o "$TEST_DIR/run_tests" Sources/TextLogic.swift "$TEST_DIR/main.swift"
+swiftc -o "$TEST_DIR/run_tests" Sources/TextLogic.swift Sources/ProofCheck.swift Sources/Outline.swift "$TEST_DIR/main.swift"
 "$TEST_DIR/run_tests"
 rm -rf "$TEST_DIR"
 

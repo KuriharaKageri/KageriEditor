@@ -80,6 +80,11 @@ final class MenuBarView: NSView {
         // キーは "removespace" のまま据え置き。変えるとユーザーが保存した並び順から
         // 外れて末尾へ飛ぶため、ラベルと中身だけを差し替えている
         ("removespace", "原稿支援"),
+        ("proofread", "推敲"),
+        // キーは据え置き。"outline" が目次（見出しを並べて飛ぶ）、
+        // "headingmark" が見出しの印を送るボタン
+        ("headingmark", "見出し"),
+        ("outline", "目次"),
         ("close", "閉じる"),
     ]
 
@@ -91,7 +96,7 @@ final class MenuBarView: NSView {
         "search", "matchlist", "spacer",
         "date", "time", "spacer",
         "undo", "redo", "spacer",
-        "wrap", "removenl", "blankline", "removespace", "spacer",
+        "wrap", "removenl", "blankline", "removespace", "proofread", "headingmark", "outline", "spacer",
         "save", "close",
     ]
 

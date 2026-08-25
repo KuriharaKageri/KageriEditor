@@ -271,6 +271,524 @@ check("複数箇所の空行はそれぞれ1行ずつ減る",
       TextTransform.removeBlankLinesStep("あ\n\nい\n\n\nう"), "あ\nい\n\nう")
 check("空行がなければ変化しない", TextTransform.removeBlankLinesStep("あ\nい\nう"), "あ\nい\nう")
 
+// ---- 原稿支援: 空白だけの行 ----
+check("支援_空白だけの行は字下げを残す設定でも空になる",
+      TextTransform.assist("\u{3000}本文\n\u{3000}\u{3000}\u{3000}\n\u{3000}次の段落",
+                           options: TextTransform.AssistOptions(removeFullWidthSpace: true)),
+      "\u{3000}本文\n\n\u{3000}次の段落")
+check("支援_除去を選んでいなければ空白の行はそのまま",
+      TextTransform.assist("あ\n\u{3000}\u{3000}\u{3000}\nい",
+                           options: TextTransform.AssistOptions(addLeadingIndent: true)),
+      "\u{3000}あ\n\u{3000}\u{3000}\u{3000}\n\u{3000}い")
+
+// ---- 原稿支援: 単位を半角に ----
+check("支援_単位だけを半角にする",
+      TextTransform.assist("全長158.1ｋｍの路線",
+                           options: TextTransform.AssistOptions(unitsToHalfWidth: true)),
+      "全長158.1kmの路線")
+check("支援_数字の後ろでない英字は単位とみなさない",
+      TextTransform.assist("ＳＴＯＰｉｔは158.1ｋｍを走る",
+                           options: TextTransform.AssistOptions(unitsToHalfWidth: true)),
+      "ＳＴＯＰｉｔは158.1kmを走る")
+check("支援_斜線でつながる単位も半角にする",
+      TextTransform.assist("最高速度は100ｋｍ／ｈ、風速は20ｍ／ｓ",
+                           options: TextTransform.AssistOptions(unitsToHalfWidth: true)),
+      "最高速度は100km/h、風速は20m/s")
+check("支援_アルファベットを全角にしても単位は半角に残る",
+      TextTransform.assist("STOPitは100km/hで走る",
+                           options: TextTransform.AssistOptions(alphabet: .fullWidth, unitsToHalfWidth: true)),
+      "ＳＴＯＰｉｔは100km/hで走る")
+
+// ---- 推敲 ----
+func proofOnly(_ kind: ProofCheck.Kind) -> ProofCheck.Options {
+    var o = ProofCheck.Options()
+    o.sentenceEnd = kind == .sentenceEnd
+    o.particleRepeat = kind == .particleRepeat
+    o.noChain = kind == .noChain
+    o.longSentence = kind == .longSentence
+    o.variant = kind == .variant
+    o.typo = kind == .typo
+    return o
+}
+func proof(_ text: String, _ kind: ProofCheck.Kind) -> [ProofCheck.Finding] {
+    ProofCheck.run(text, options: proofOnly(kind))
+}
+
+// 語尾は文字ではなく型で比べる
+checkI("推敲_文字が違っても過去は同じ型",
+       ProofCheck.endingType("人々を運んだ。") == .ta &&
+       ProofCheck.endingType("輸送量も増えた。") == .ta &&
+       ProofCheck.endingType("需要が高まった。") == .ta ? 1 : 0, 1)
+checkI("推敲_断定と過去を取り違えない",
+       ProofCheck.endingType("これは転換点だ。") == .da &&
+       ProofCheck.endingType("荷物を運んだ。") == .ta ? 1 : 0, 1)
+checkI("推敲_丁寧はます_ました_ませんを分ける",
+       ProofCheck.endingType("走ります。") == .masu &&
+       ProofCheck.endingType("開業しました。") == .mashita &&
+       ProofCheck.endingType("ありません。") == .masen ? 1 : 0, 1)
+checkI("推敲_体言止めは判定しない",
+       ProofCheck.endingType("新橋―横浜間の開業。") == .other ? 1 : 0, 1)
+
+checkI("推敲_語尾が三文続くと指摘する",
+       proof("人々を運んだ。輸送量も増えた。需要が高まった。", .sentenceEnd).count, 1)
+checkI("推敲_二文なら指摘しない",
+       proof("人々を運んだ。輸送量も増えた。", .sentenceEnd).count, 0)
+checkI("推敲_段落をまたぐ連続は数えない",
+       proof("運んだ。増えた。\n高まった。広がった。", .sentenceEnd).count, 0)
+checkI("推敲_箇条書きは対象外",
+       proof("・新橋に着いた\n・横浜に着いた\n・神戸に着いた", .sentenceEnd).count, 0)
+checkI("推敲_ますとませんが混ざれば連続としない",
+       proof("土台になります。差し替えます。ダイアログがありません。", .sentenceEnd).count, 0)
+
+checkI("推敲_同じ助詞が四回で指摘する",
+       proof("新橋が起点となった鉄道が横浜まで延びる工事が遅れて開業が翌年になった。", .particleRepeat).count, 1)
+// 文脈上どうしても同じ助詞が続くとき、読点で意味を切り分けてリズムを整えるのは
+// 書き手の技術なので、続けざまに重なる場合と同じには扱わない（4回でも黙る）
+checkI("推敲_読点で切り分けてあれば指摘しない",
+       proof("新橋が起点となったが、横浜側が先に完成し、開業が遅れた。", .particleRepeat).count, 0)
+// 読点1つぶんの割り引きでは4回に届かない（4 − 0.5 = 3.5）
+checkI("推敲_四回で読点が一つなら指摘しない",
+       proof("新橋が起点となった鉄道が横浜まで延び、工事が遅れて開業が翌年になった。", .particleRepeat).count, 0)
+// 割り引いてもなお多ければ指摘する（5 − 0.5 = 4.5）
+checkI("推敲_読点があっても回数が多ければ指摘する",
+       proof("新橋が起点となった鉄道が横浜まで延び、工事が遅れて開業が翌年になり利用者が戸惑った。", .particleRepeat).count, 1)
+checkI("推敲_三回なら指摘しない",
+       proof("新橋が起点となったが、横浜側が先に完成した。", .particleRepeat).count, 0)
+checkI("推敲_引用のとは数えない",
+       proof("「日本でも展開すべき」と要望を送るうちに呼ばれ、渡米すると「あなたがやればいい」と押されて代理店として創業した。", .particleRepeat).count, 0)
+checkI("推敲_できるのでは数えない",
+       proof("駅前では匿名で相談できるが、窓口では受け付けできない。", .particleRepeat).count, 0)
+checkI("推敲_動詞のがるは数えない",
+       proof("確率が上がる。物語が盛り上がり、費用が膨れ上がった。", .particleRepeat).count, 0)
+
+checkI("推敲_のが三つ続くと指摘する",
+       proof("日本の鉄道の歴史の転換点だった。", .noChain).count, 1)
+checkI("推敲_読点を挟めば途切れる",
+       proof("日本の鉄道の、歴史の転換点だった。", .noChain).count, 0)
+
+checkI("推敲_長い文を指摘する",
+       proof(String(repeating: "あ", count: 120) + "。", .longSentence).count, 1)
+checkI("推敲_上限以下なら指摘しない",
+       proof(String(repeating: "あ", count: 50) + "。", .longSentence).count, 0)
+
+checkI("推敲_表記ゆれは少ない方を指摘する",
+       proof("子供が来た。子どもが遊ぶ。子どもが帰る。", .variant).count, 1)
+checkI("推敲_片方で統一されていれば黙る",
+       proof("子どもが来た。子どもが遊ぶ。", .variant).count, 0)
+checkI("推敲_複合語の漢字を巻き込まない",
+       proof("記事を書く。事故が起きた。仕事をする。", .variant).count, 0)
+checkI("推敲_というやそういうのいうは数えない",
+       proof("谷山氏は言う。そういう心理が働くという。相談しやすいという環境がいる。", .variant).count, 0)
+checkI("推敲_そのものは数えない",
+       proof("未来そのものを変える。読んだ物を並べる。", .variant).count, 0)
+checkI("推敲_ものの逆接は数えない",
+       proof("出来事だったものの、1分しかたっていない。読んだ物を並べる。", .variant).count, 0)
+checkI("推敲_複合名詞の物は数えない",
+       proof("大切な食べ物であり、海の生き物が減る。買い物に行く。読んだものを並べる。", .variant).count, 0)
+checkI("推敲_連体形に続く物とものは拾う",
+       proof("読んだ物を並べる。読んだものを数える。読んだものを片づける。", .variant).count, 1)
+
+// 会話文は句点なしで「」を閉じるので、そこで文が切れないと次の段落とつながる
+checkI("推敲_閉じ括弧で終わる行は文が切れる",
+       ProofCheck.splitSentences(Array("「そう思いました」\n\u{3000}起業のきっかけは出会いだった。")).count, 2)
+// 整形が入れた改行で文が分断されないよう、改行1つでは切らない
+checkI("推敲_改行だけでは文を切らない",
+       ProofCheck.splitSentences(Array("次の一致箇所へ\n移動します。")).count, 1)
+
+// ---- 単位 ----
+checkI("単位_全角の単位は揺れていなくても指摘する",
+       proof("全長158.1ｋｍの路線だ。", .variant).count, 1)
+checkI("単位_半角なら何も言わない",
+       proof("全長158.1kmの路線だ。", .variant).count, 0)
+checkI("単位_全角の単語と半角の単位が同居していてよい",
+       proof("ＳＴＯＰｉｔを導入した。全長158.1kmだ。", .variant).count, 0)
+checkI("単位_斜線でつながる単位はひとまとまりで1件",
+       proof("最高速度は100ｋｍ/ｈだ。", .variant).count, 1)
+checkI("単位_毎秒メートルも拾う",
+       proof("風速は20ｍ/ｓだった。", .variant).count, 1)
+checkI("単位_数字の後ろでなければ単位ではない",
+       proof("ＬはＬでも大文字だ。", .variant).count, 0)
+
+checkI("推敲_誤植の助詞の重複を拾う", proof("鉄道がが開業した。", .typo).count, 1)
+checkI("推敲_語頭の重なりは拾わない", proof("がががんばる。", .typo).count, 0)
+checkI("推敲_問題がなければ空を返す",
+       ProofCheck.run("春はあけぼの。やうやう白くなりゆく山際、少し明かりて。").count, 0)
+checkI("推敲_空文字でも落ちない", ProofCheck.run("").count, 0)
+
+// 文頭の「ところが」は接続で、漢字で書くことはない。形式名詞として数えない
+checkI("推敲_文頭のところがは形式名詞ではない",
+       proof("訪れた所は静かだった。ところが、誰もいなかった。", .variant).count, 0)
+checkI("推敲_文頭のところでも数えない",
+       proof("訪れた所は静かだった。ところで、話は変わる。", .variant).count, 0)
+// 連体形の語尾に続く本当の形式名詞は、これまでどおり拾う
+checkI("推敲_連体形に続くところは拾う",
+       proof("読んだところ、正しかった。訪れた所は静かだった。", .variant).count, 1)
+
+// 「ごとき」は助動詞「ごとし」で、形式名詞の「とき」ではない
+checkI("推敲_ごときはときと数えない",
+       proof("小供のごときは。その時は静かだった。", .variant).count, 0)
+checkI("推敲_ひとときもときと数えない",
+       proof("ひとときの静けさ。その時は過ぎた。", .variant).count, 0)
+// 本当の形式名詞の「とき」は、これまでどおり拾う
+checkI("推敲_連体形に続くときは拾う",
+       proof("読んだとき、正しかった。その時は静かだった。", .variant).count, 1)
+
+// ---- 英文の行には字下げを足さない ----
+var assistIndentOnly = TextTransform.AssistOptions()
+assistIndentOnly.addLeadingIndent = true
+// 一字下げは日本語の段落の作法なので、英文の行には足さない
+check("原稿支援_英文の行には字下げを足さない",
+      TextTransform.assist("The quick brown fox.", options: assistIndentOnly),
+      "The quick brown fox.")
+check("原稿支援_URLの行にも足さない",
+      TextTransform.assist("https://example.com/article", options: assistIndentOnly),
+      "https://example.com/article")
+// 英単語で始まっても、日本語が入っていれば段落なので字下げする
+check("原稿支援_英単語で始まる日本語の段落は字下げする",
+      TextTransform.assist("iPadは便利だ。", options: assistIndentOnly), "\u{3000}iPadは便利だ。")
+check("原稿支援_日本語の段落はこれまでどおり字下げする",
+      TextTransform.assist("本文です。", options: assistIndentOnly), "\u{3000}本文です。")
+
+// ---- 英文の中の空白は残す ----
+var assistHalfOnly = TextTransform.AssistOptions()
+assistHalfOnly.removeHalfWidthSpace = true
+// 英単語の「間」を詰めたい場面は無い。前後が半角なら英文の一部とみなす
+check("原稿支援_英文の空白は残す",
+      TextTransform.assist("これでは「法の支配（rule of law）」ではない。", options: assistHalfOnly),
+      "これでは「法の支配（rule of law）」ではない。")
+check("原稿支援_日本語に混じった空白は消す",
+      TextTransform.assist("ICC の判断 について。", options: assistHalfOnly), "ICCの判断について。")
+// 「Mr. Smith」のように、前が記号でも後ろが英字なら英文
+check("原稿支援_英文の記号のあとの空白も残す",
+      TextTransform.assist("Mr. Smith が来た。", options: assistHalfOnly), "Mr. Smithが来た。")
+// 「1. はじめに」は日本語なので消える
+check("原稿支援_番号のあとの日本語は詰める",
+      TextTransform.assist("1. はじめに", options: assistHalfOnly), "1.はじめに")
+// 英文の中は残り、日本語との境目だけが消える
+check("原稿支援_英文と日本語の境目だけ消す",
+      TextTransform.assist("the ICC でした", options: assistHalfOnly), "the ICCでした")
+
+// ---- 見えない文字 ----
+// 幅ゼロの書式制御文字は0字。以前は半角1つぶんとして数えていた
+checkD("字数_ゼロ幅空白は数えない", CharWidth.measure("あ\u{200B}い").zenkaku, 2.0)
+checkD("字数_BOMは数えない", CharWidth.measure("あ\u{FEFF}い").zenkaku, 2.0)
+checkD("字数_単語結合子は数えない", CharWidth.measure("あ\u{2060}い").zenkaku, 2.0)
+// 見えない空白は、半角スペースと同じ扱いで除去できる
+var assistInvisible = TextTransform.AssistOptions()
+assistInvisible.removeHalfWidthSpace = true
+check("原稿支援_見えない空白も除去する",
+      TextTransform.assist("あ\u{00A0}い", options: assistInvisible), "あい")
+check("原稿支援_幅ゼロの文字も除去する",
+      TextTransform.assist("あ\u{200B}\u{FEFF}い", options: assistInvisible), "あい")
+// 選んでいなければ手を触れない
+var assistFullOnly = TextTransform.AssistOptions()
+assistFullOnly.removeFullWidthSpace = true
+check("原稿支援_選ばなければ見えない空白も残す",
+      TextTransform.assist("あ\u{00A0}い", options: assistFullOnly), "あ\u{00A0}い")
+
+// ---- 原稿支援は見出しの印に触れない ----
+// 「# 」の後ろは半角スペース。除去されると印が壊れ、目次も並べ替えも失われる
+var assistHalf = TextTransform.AssistOptions()
+assistHalf.removeHalfWidthSpace = true
+check("原稿支援_半角スペース除去で印を壊さない",
+      TextTransform.assist("# 見出し\n\u{3000}本 文です。", options: assistHalf),
+      "# 見出し\n\u{3000}本文です。")
+var assistFull = TextTransform.AssistOptions()
+assistFull.removeFullWidthSpace = true
+assistFull.removeLeadingIndent = true
+check("原稿支援_全角スペース除去でも印は残る",
+      TextTransform.assist("## 小見出し\n\u{3000}本文です。", options: assistFull),
+      "## 小見出し\n本文です。")
+// 見出しには字下げを付けない
+var assistIndent = TextTransform.AssistOptions()
+assistIndent.addLeadingIndent = true
+check("原稿支援_見出しには字下げを付けない",
+      TextTransform.assist("# 見出し\n本文です。", options: assistIndent),
+      "# 見出し\n\u{3000}本文です。")
+
+// ---- 見出し行は整形・非整形しない ----
+// 次の行が字下げされていなくても、見出しは飲み込まれない
+check("非整形_見出しの後ろの改行を残す",
+      TextTransform.removeNewlines("# 見出し\n字下げなしの本文です。"),
+      "# 見出し\n字下げなしの本文です。")
+check("非整形_見出しの前の改行を残す",
+      TextTransform.removeNewlines("字下げなしの本文です。\n# 見出し"),
+      "字下げなしの本文です。\n# 見出し")
+check("非整形_小見出しも同じ",
+      TextTransform.removeNewlines("## 小見出し\n本文です。"), "## 小見出し\n本文です。")
+// 本文どうしは、これまでどおり連結する
+check("非整形_本文どうしは連結する",
+      TextTransform.removeNewlines("あいう。\nえお。"), "あいう。えお。")
+// 空行は非整形では詰めない（詰めるのは「空行除去」だけ）
+check("非整形_空行は詰めない",
+      TextTransform.removeNewlines("あ。\n\nい。"), "あ。\n\nい。")
+// 空白だけの行も、書き手には空行に見える。次の行に吸収させない
+check("非整形_空白だけの行も詰めない",
+      TextTransform.removeNewlines("あ。\n\u{3000}\nい。"), "あ。\n\u{3000}\nい。")
+// 長い見出しを折り返すと、後半が本文の行として独立してしまう
+check("整形_見出しは折り返さない",
+      TextTransform.wrap("# " + String(repeating: "あ", count: 30) + "\n", limit: 20),
+      "# " + String(repeating: "あ", count: 30) + "\n")
+check("整形_本文はこれまでどおり折り返す",
+      TextTransform.wrap(String(repeating: "あ", count: 30), limit: 20),
+      String(repeating: "あ", count: 20) + "\n" + String(repeating: "あ", count: 10))
+// 印ではない「#」で始まる行は本文なので、これまでどおり折り返す
+check("整形_印でないシャープの行は折り返す",
+      TextTransform.wrap("#" + String(repeating: "あ", count: 30), limit: 20),
+      "#" + String(repeating: "あ", count: 19) + "\n" + String(repeating: "あ", count: 11))
+check("整形_空行は詰めない",
+      TextTransform.wrap("あ。\n\nい。", limit: 20), "あ。\n\nい。")
+
+// ---- 見出し（簡易アウトライン） ----
+func headingTitles(_ text: String) -> [String] { Outline.headings(text).map { $0.text } }
+
+checkI("見出し_字下げのない短い行を拾う",
+       headingTitles("姫新線の歴史\n\n\u{3000}姫新線は兵庫県の路線です。") == ["姫新線の歴史"] ? 1 : 0, 1)
+checkI("見出し_字下げのある行は本文",
+       headingTitles("\u{3000}姫新線は兵庫県の路線です。").count, 0)
+checkI("見出し_句点で終わる行は字下げがなくても本文",
+       headingTitles("姫新線は兵庫県の路線です。").count, 0)
+checkI("見出し_長い行は本文", headingTitles(String(repeating: "あ", count: 40)).count, 0)
+checkI("見出し_会話文は見出しにしない", headingTitles("「最初の1年は苦しかったです」").count, 0)
+checkI("見出し_箇条書きは見出しにしない", headingTitles("・新橋に着いた\n・横浜に着いた").count, 0)
+checkI("見出し_大見出しと小見出しが続いていても両方拾う",
+       headingTitles("姫新線の歴史\n伯備線との接続を目指す\n\n\u{3000}姫新線は兵庫県の路線です。").count, 2)
+checkI("見出し_プロットは全部拾える",
+       headingTitles("姫新線の歴史\n急行列車の時代\n姫新線の車両").count, 3)
+checkD("見出し_本文のない見出しは0枚",
+       Outline.headings("姫新線の歴史\n急行列車の時代").first?.sheets ?? -1, 0.0)
+checkD("見出し_見出しから次の見出しまでを数える",
+       Outline.headings("見出し一\n\u{3000}" + String(repeating: "あ", count: 399) + "\n見出し二\n").first?.sheets ?? -1, 1.0)
+checkI("見出し_空文字でも落ちない", Outline.headings("").count, 0)
+// 「です」の「で」は断定の助動詞で、助詞ではない
+checkI("推敲_ですのでは数えない",
+       proof("水流の中で育てるので、1カ月で出荷でき、何度でも連作が可能です。", .particleRepeat).count, 0)
+// ただし「駅ですぐ」の「で」は助詞なので、これまでどおり数える
+checkI("推敲_ですぐのでは数える",
+       proof("駅ですぐ乗れる列車で移動し現地で食事をとり宿で休む。", .particleRepeat).count, 1)
+// 「こと」の「と」は形式名詞の一部で、助詞ではない
+checkI("推敲_ことのとは数えない",
+       proof("対等であること、機能が一体になること、共同販売とすること。", .particleRepeat).count, 0)
+// 「である」と「だ」は読むと調子が違うので、連続とみなさない
+checkI("推敲_であるとだは別の調子",
+       proof("この点はデリケートである。差別の記憶に直結するからだ。美化することにも慎重である。", .sentenceEnd).count, 0)
+checkI("推敲_であるが三つ続けば指摘する",
+       proof("これは事実である。あれも事実である。それも事実である。", .sentenceEnd).count, 1)
+// 「いよいよ」の中の「よい」は「良い」の表記ゆれではない
+checkI("推敲_いよいよはよいと数えない",
+       proof("いよいよ車窓に太平洋が見えてきた。眺めは良い。", .variant).count, 0)
+// 「っていう」の「いう」は動詞ではない
+checkI("推敲_っていうはいうと数えない",
+       proof("便利すぎる物語だなっていうより。彼はこう言う。", .variant).count, 0)
+// つなぐ「の」の後ろには必ず名詞が来る。「そのもの。」の「の」は数えない
+checkI("推敲_そのものは数えない",
+       proof("同じ仕事をする親子の意地の張り合いそのもの。", .noChain).count, 0)
+
+// ---- 章立ての行 ----
+// 章の見出しは副題を伴って30字を超えることがよくある
+checkI("見出し_長い章見出しも拾う",
+       Outline.headings("第1章：淀屋橋駅の朝。限られた番線での秒単位のオペレーション（実況観察）\n\u{3000}本文です。").count, 1)
+checkI("見出し_漢数字の章も拾う",
+       Outline.headings("第十二章　" + String(repeating: "あ", count: 40) + "\n\u{3000}本文です。").count, 1)
+checkI("見出し_第のない章も拾う",
+       Outline.headings("2章　" + String(repeating: "あ", count: 40) + "\n\u{3000}本文です。").count, 1)
+checkI("見出し_節や話も拾う",
+       Outline.headings("第3節　" + String(repeating: "あ", count: 40) + "\n第4話　" + String(repeating: "あ", count: 40) + "\n").count, 2)
+// 字下げと句点の規則はそのまま。本文中の「第三章では〜」は拾わない
+checkI("見出し_字下げされた章の言及は拾わない",
+       Outline.headings("\u{3000}第三章では" + String(repeating: "あ", count: 40) + "\n").count, 0)
+checkI("見出し_句点で終わる章の言及は拾わない",
+       Outline.headings("第三章では" + String(repeating: "あ", count: 40) + "。\n").count, 0)
+// 章立てでない長い行は、これまでどおり本文
+checkI("見出し_章立てでない長い行は本文",
+       Outline.headings("第一印象は" + String(repeating: "あ", count: 40) + "\n").count, 0)
+
+// ---- 決まり文句の見出し ----
+// 副題が付いて長くなっても拾う
+checkI("見出し_決まり文句は長さで外さない",
+       Outline.headings("はじめに　" + String(repeating: "あ", count: 40) + "\nまとめ：" + String(repeating: "あ", count: 40) + "\n").count, 2)
+checkI("見出し_決まり文句だけの行も拾う",
+       Outline.headings("おわりに\n\u{3000}本文です。").count, 1)
+// 区切りがなければ本文。「はじめに述べたとおり」を巻き込まない
+checkI("見出し_決まり文句に続く本文は拾わない",
+       Outline.headings("はじめに述べたとおり" + String(repeating: "あ", count: 40) + "\n").count, 0)
+checkI("見出し_まとめるとも拾わない",
+       Outline.headings("まとめると" + String(repeating: "あ", count: 40) + "\n").count, 0)
+// 字下げと句点の規則はそのまま
+checkI("見出し_字下げされた決まり文句は拾わない",
+       Outline.headings("\u{3000}まとめ　" + String(repeating: "あ", count: 40) + "\n").count, 0)
+checkI("見出し_句点で終わる決まり文句は拾わない",
+       Outline.headings("おわりに　" + String(repeating: "あ", count: 40) + "。\n").count, 0)
+
+// 箇条書きや注記の印で始まる行は、短くても句点がなくても本文
+checkI("見出し_アスタリスクの行は見出しにしない",
+       Outline.headings("*注記の行\n\u{3000}本文です。").count, 0)
+checkI("見出し_米印の行は見出しにしない",
+       Outline.headings("※注記の行\n\u{3000}本文です。").count, 0)
+checkI("見出し_ハイフンの行は見出しにしない",
+       Outline.headings("-箇条書き\n\u{3000}本文です。").count, 0)
+checkI("見出し_ダッシュの行は見出しにしない",
+       Outline.headings("――そして誰もいなくなった\n\u{3000}本文です。").count, 0)
+
+// ---- 見出しの印 ----
+func headingNames(_ text: String) -> [String] { Outline.headings(text).map { $0.title } }
+
+// 印が1つでもあれば推定をやめる。宣言したものだけが見出しになる
+checkI("印_印がある文書では印だけを見出しにする",
+       headingNames("# 第一章\n\u{3000}本文です。\n推定なら見出しになる行\n# 第二章\n")
+           == ["第一章", "第二章"] ? 1 : 0, 1)
+checkI("印_印がなければこれまでどおり推定する",
+       headingNames("推定の見出し\n\u{3000}本文です。\n") == ["推定の見出し"] ? 1 : 0, 1)
+checkI("印_大見出しと小見出しの段が分かれる",
+       Outline.headings("# 大見出し\n## 小見出し\n").map { $0.level } == [1, 2] ? 1 : 0, 1)
+// 見出しは2段まで。「###」以上は印ではない
+checkI("印_シャープ三つは印ではない", Outline.hasMarks("### 見出し") ? 1 : 0, 0)
+// 印はボタンで入れるので、全角と半角の打ち分けに迷うことはない
+checkI("印_全角シャープは印ではない", Outline.hasMarks("＃ 見出し") ? 1 : 0, 0)
+// 「# 」まで打って中身がまだない行を、見出しとして並べても仕方がない
+checkI("印_印だけの行は見出しにしない", Outline.headings("# \n\u{3000}本文です。").count, 0)
+
+// ---- 印は数から除く ----
+checkD("印_字数から印を除く",
+       CharWidth.measure("# 第一章\n\u{3000}本文", excludeHeadingMarks: true).zenkaku, 6.0)
+checkI("印_除いた字数を数えておく",
+       CharWidth.measure("# 第一章\n\u{3000}本文", excludeHeadingMarks: true).marks, 2)
+checkD("印_除かなければこれまでどおり数える",
+       CharWidth.measure("# 第一章\n\u{3000}本文").zenkaku, 7.0)
+// 20字ちょうどの見出しは、印を入れると21字になって2行を食う
+checkI("印_原稿用紙の行数からも除く",
+       CharWidth.manuscriptLines("# " + String(repeating: "あ", count: 20),
+                                 excludeHeadingMarks: true), 1)
+checkI("印_除かなければ印も行を食う",
+       CharWidth.manuscriptLines("# " + String(repeating: "あ", count: 20)), 2)
+// 印ではない「#」は、これまでどおり本文として数える
+checkD("印_印でないシャープは本文のまま",
+       CharWidth.measure("#1 の札", excludeHeadingMarks: true).zenkaku, 3.5)
+
+// ---- 印を付け外しする ----
+check("印_なしから大見出しになる",
+      Outline.cycleMark("第一章\n\u{3000}本文", selStart: 0, selEnd: 0).text,
+      "# 第一章\n\u{3000}本文")
+check("印_大見出しから小見出しになる",
+      Outline.cycleMark("# 第一章", selStart: 0, selEnd: 0).text, "## 第一章")
+check("印_小見出しをもう一度送ると外れる",
+      Outline.cycleMark("## 第一章", selStart: 0, selEnd: 0).text, "第一章")
+check("印_選択した行をまとめて送る",
+      Outline.cycleMark("一\n二\n三", selStart: 0, selEnd: 5).text, "# 一\n# 二\n# 三")
+// ばらついている行をそのまま送ると結果が予想できないので、先頭の行に揃える
+check("印_ばらついていても先頭の行に揃える",
+      Outline.cycleMark("# 一\n二", selStart: 0, selEnd: 6).text, "## 一\n## 二")
+// 印を付けた行では、カーソルが印のぶん後ろへ動く
+checkI("印_カーソルが印のぶん動く",
+       Outline.cycleMark("第一章", selStart: 1, selEnd: 1).selStart, 3)
+// 行頭で押したときは印の後ろへ送る。印を付けてすぐ書き始められるように
+checkI("印_行頭で押すとカーソルは印の後ろへ",
+       Outline.cycleMark("第一章", selStart: 0, selEnd: 0).selStart, 2)
+// 空の行に印を付けた直後から書き始められる
+checkI("印_空の行でもカーソルは印の後ろへ",
+       Outline.cycleMark("\u{3000}本文です。\n\n次の行", selStart: 7, selEnd: 7).selStart, 9)
+// 印を外したときは、カーソルが行頭へ戻る
+checkI("印_外すとカーソルは行頭へ",
+       Outline.cycleMark("## 第一章", selStart: 3, selEnd: 3).selStart, 0)
+// 入稿の直前に外せば、画面の字数と受け取った側で数えた字数が一致する
+check("印_一括で外す", Outline.stripMarks("# 一\n## 二\n\u{3000}本文"), "一\n二\n\u{3000}本文")
+check("印_印がなければ一括で外しても変わらない", Outline.stripMarks("一\n二"), "一\n二")
+
+// ---- ファイル名と見出しの印 ----
+// 印は原稿ではないので、ファイル名にも入れない
+check("ファイル名_見出しの印は入れない",
+      FileNaming.fileName(fromFirstLineOf: "# 姫新線の歴史\n\u{3000}本文です。"), "姫新線の歴史")
+check("ファイル名_小見出しの印も入れない",
+      FileNaming.fileName(fromFirstLineOf: "## 第一章\n\u{3000}本文です。"), "第一章")
+// 「# 」まで打った行はまだ中身がないので、次の行から名前を作る
+check("ファイル名_印だけの行は飛ばす",
+      FileNaming.fileName(fromFirstLineOf: "# \n姫新線の歴史\n"), "姫新線の歴史")
+// 「#」はURLの断片の区切りなので、ファイル名には残さない
+check("ファイル名_印でないシャープは全角にする",
+      FileNaming.fileName(fromFirstLineOf: "#1 の札"), "＃1 の札")
+
+// ---- 節の並べ替え ----
+let reorderDoc = "まえがき。\n# 一章\n\u{3000}本文一。\n\n# 二章\n\u{3000}本文二。\n\n# 三章\n\u{3000}本文三。\n"
+
+func applyPlan(_ text: String, _ plan: [Outline.Placed]) -> String {
+    guard let p = Outline.reorderPatch(text, plan: plan) else { return text }
+    let ns = text as NSString
+    return ns.replacingCharacters(
+        in: NSRange(location: p.start, length: p.end - p.start), with: p.replacement)
+}
+
+check("節_見出しの前の空行は自分の節に含む",
+      (reorderDoc as NSString).substring(with: NSRange(
+        location: Outline.sections(reorderDoc)[1].start,
+        length: Outline.sections(reorderDoc)[1].end - Outline.sections(reorderDoc)[1].start)),
+      "\n# 二章\n\u{3000}本文二。\n")
+check("節_最初の見出しより前は節に入らない",
+      (reorderDoc as NSString).substring(to: Outline.preambleEnd(reorderDoc)), "まえがき。\n")
+// 動かした節が、自分の前の空行を連れていく
+check("節_入れ替えても見出しの前の空行が残る",
+      applyPlan(reorderDoc, [Outline.Placed(0, 1), Outline.Placed(2, 1), Outline.Placed(1, 1)]),
+      "まえがき。\n# 一章\n\u{3000}本文一。\n\n# 三章\n\u{3000}本文三。\n\n# 二章\n\u{3000}本文二。\n")
+// 変わっていない前後は書き換えない（大きな文書で全文が作り直されないように）
+checkI("節_変わっていない前後は書き換えに含めない",
+       Outline.reorderPatch(reorderDoc,
+                            plan: [Outline.Placed(0, 1), Outline.Placed(2, 1), Outline.Placed(1, 1)])?.start ?? -1,
+       Outline.sections(reorderDoc)[1].start)
+checkI("節_変わっていなければ書き換えない",
+       Outline.reorderPatch(reorderDoc,
+                            plan: [Outline.Placed(0, 1), Outline.Placed(1, 1), Outline.Placed(2, 1)]) == nil ? 1 : 0, 1)
+// 取りこぼしや重複のある計画は当てない（本文が消えるため）
+checkI("節_壊れた計画は当てない",
+       Outline.reorderPatch(reorderDoc,
+                            plan: [Outline.Placed(0, 1), Outline.Placed(0, 1), Outline.Placed(2, 1)]) == nil ? 1 : 0, 1)
+// 大見出しは、続く小見出しを引き連れて動く
+checkI("節_大見出しは小見出しを連れて動く",
+       Outline.groupSize(Outline.sections("# A\n## a1\n## a2\n# B\n"), 0), 3)
+check("節_段を変えると印が付け替わる",
+      applyPlan("# 一\n本文\n# 二\n本文\n", [Outline.Placed(0, 1), Outline.Placed(1, 2)]),
+      "# 一\n本文\n## 二\n本文\n")
+// 末尾の節には改行がないことがある。そのまま動かすと行が繋がってしまう
+check("節_末尾の節を前へ動かすと改行が補われる",
+      applyPlan("# 一章\n\u{3000}本文一。\n\n# 二章\n\u{3000}本文二。",
+                [Outline.Placed(1, 1), Outline.Placed(0, 1)]),
+      "# 二章\n\u{3000}本文二。\n# 一章\n\u{3000}本文一。\n")
+// 空行の数はそのまま運ぶ。ただし文書の先頭に来た節は、連れてきた空行を落とす
+check("節_先頭に来た節は空行を落とす",
+      applyPlan("# 一\n本文一。\n\n\n# 二\n本文二。\n",
+                [Outline.Placed(1, 1), Outline.Placed(0, 1)]),
+      "# 二\n本文二。\n# 一\n本文一。\n")
+// 前書きがあれば、先頭に来た節の空行は前書きとの区切りとして残る
+check("節_前書きの後ろでは空行が残る",
+      applyPlan("まえがき。\n# 一\n本文一。\n\n\n# 二\n本文二。\n",
+                [Outline.Placed(1, 1), Outline.Placed(0, 1)]),
+      "まえがき。\n\n\n# 二\n本文二。\n# 一\n本文一。\n")
+// 印のない文書は並べ替えの対象にしない（推定の誤りで段落が分断されるため）
+checkI("節_印のない文書には節がない",
+       Outline.sections("推定の見出し\n\u{3000}本文です。\n").count, 0)
+
+// ---- 推定した見出しに印を打つ ----
+func applyMarks(_ text: String, _ starts: [Int]) -> String {
+    guard let p = Outline.applyMarks(text, lineStarts: starts) else { return text }
+    return (text as NSString).replacingCharacters(
+        in: NSRange(location: p.start, length: p.end - p.start), with: p.replacement)
+}
+
+let candidateDoc = "見出し一\n\u{3000}本文です。\nキャプション\n見出し二\n"
+checkI("確定_推定は三件拾う", Outline.headings(candidateDoc).count, 3)
+// 書き手が1件目と3件目だけを選ぶ
+check("確定_選んだ行にだけ印を打つ",
+      applyMarks(candidateDoc, [Outline.headings(candidateDoc)[0].start,
+                                Outline.headings(candidateDoc)[2].start]),
+      "# 見出し一\n\u{3000}本文です。\nキャプション\n# 見出し二\n")
+// 印を打った文書では推定が止まり、選ばなかった行は見出しでなくなる
+checkI("確定_打ったあとは印だけに従う",
+       Outline.headings(applyMarks(candidateDoc,
+                                   [Outline.headings(candidateDoc)[0].start,
+                                    Outline.headings(candidateDoc)[2].start])).count, 2)
+checkI("確定_すでに印のある行は飛ばす",
+       Outline.applyMarks("# 見出し\n\u{3000}本文です。", lineStarts: [0]) == nil ? 1 : 0, 1)
+checkI("確定_一つも選ばなければ何もしない",
+       Outline.applyMarks("見出し\n", lineStarts: []) == nil ? 1 : 0, 1)
+
 if failures == 0 {
     print("\nすべてのテストに合格")
 } else {

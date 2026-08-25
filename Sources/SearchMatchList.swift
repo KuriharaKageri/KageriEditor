@@ -12,6 +12,44 @@ private struct DocMatchEntry {
     let hlEnd: Int
 }
 
+// ============================================================
+// 一覧パネル共通の見た目
+// ============================================================
+/// 検索結果一覧・推敲・見出しの3つのパネルが共通で使う文字サイズ。
+///
+/// ディスプレイの解像度や設定によっては既定の12ポイントが小さく感じるため、
+/// 設定で変えられるようにしている。**本文の文字サイズとは別に持つ**——
+/// 一覧は補助的な表示なので、本文と同じ大きさにすると場所を取りすぎるため。
+enum ListAppearance {
+
+    static let defaultSize: Double = 12
+
+    static var size: CGFloat {
+        let v = UserDefaults.standard.double(forKey: "listFontSize")
+        return CGFloat(v > 0 ? v : defaultSize)
+    }
+
+    static var font: NSFont { NSFont.systemFont(ofSize: size) }
+    static var boldFont: NSFont { NSFont.boldSystemFont(ofSize: size) }
+
+    /// 見出し行（種類・行番号・説明）や枚数に使う、少し小さい字
+    static var captionSize: CGFloat { max(9, size - 2) }
+    static var captionFont: NSFont { NSFont.systemFont(ofSize: captionSize) }
+
+    /// 1行の高さ。linesは1行の表示に使う行数（推敲だけ見出し行＋本文の2行）
+    static func rowHeight(lines: Int) -> CGFloat {
+        lines <= 1 ? size * 1.85 : size * 1.85 + captionSize * 1.7 + 4
+    }
+
+    /// 設定で文字サイズが変わったことを知らせる。
+    /// 開いたままの一覧にもすぐ反映するために使う（戻り値は解除用のトークン）
+    static func observeChanges(_ handler: @escaping () -> Void) -> NSObjectProtocol {
+        NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification, object: nil, queue: .main
+        ) { _ in handler() }
+    }
+}
+
 /// 検索語の前後に表示する文字数（これを超える分は…で省略する）
 private let matchContextChars = 18
 
@@ -23,6 +61,11 @@ final class MatchListWindowController: NSWindowController, NSTableViewDataSource
     private let searchField = NSSearchField()
     private let tableView = NSTableView()
     private var matches: [DocMatchEntry] = []
+    private var appearanceObserver: NSObjectProtocol?
+
+    deinit {
+        if let o = appearanceObserver { NotificationCenter.default.removeObserver(o) }
+    }
 
     convenience init(textView: NSTextView, initialQuery: String) {
         let panel = NSPanel(
@@ -53,7 +96,12 @@ final class MatchListWindowController: NSWindowController, NSTableViewDataSource
         scroll.borderType = .bezelBorder
 
         tableView.headerView = nil
-        tableView.rowHeight = 22
+        tableView.rowHeight = ListAppearance.rowHeight(lines: 1)
+        appearanceObserver = ListAppearance.observeChanges { [weak self] in
+            guard let self else { return }
+            self.tableView.rowHeight = ListAppearance.rowHeight(lines: 1)
+            self.tableView.reloadData()
+        }
         tableView.dataSource = self
         tableView.delegate = self
         tableView.target = self
@@ -184,13 +232,13 @@ final class MatchListWindowController: NSWindowController, NSTableViewDataSource
         let m = matches[row]
         let label = "\(m.line)行目：\(m.snippet)"
         let content = NSMutableAttributedString(string: label, attributes: [
-            .font: NSFont.systemFont(ofSize: 12),
+            .font: ListAppearance.font,
             .foregroundColor: NSColor.labelColor,
         ])
         let prefixLength = (label as NSString).length - (m.snippet as NSString).length
         let hlRange = NSRange(location: prefixLength + m.hlStart, length: m.hlEnd - m.hlStart)
         if hlRange.location >= 0, NSMaxRange(hlRange) <= content.length {
-            content.addAttribute(.font, value: NSFont.boldSystemFont(ofSize: 12), range: hlRange)
+            content.addAttribute(.font, value: ListAppearance.boldFont, range: hlRange)
             content.addAttribute(.foregroundColor, value: NSColor.systemRed, range: hlRange)
         }
         field.attributedStringValue = content

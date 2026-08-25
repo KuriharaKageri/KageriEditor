@@ -120,7 +120,25 @@ final class LineNumberRulerView: NSRulerView {
 
     @objc private func scrolled() { needsDisplay = true }
 
+    /**
+     * （グリフ位置 → 表示行番号）の控え。
+     *
+     * 可視範囲の先頭が何行目かは、本来なら文書の先頭から数えるしかない。
+     * それをやると**描画のたびに文書全体のレイアウトが走る**ので、大きな文書では
+     * スクロールも入力も追いつかなくなる（540万字で応答なしになった原因）。
+     * 一定行ごとに控えを取り、近い地点から数え直すことで、毎回の仕事を
+     * 「直前の控えから可視範囲まで」に抑える。
+     */
+    private var lineCheckpoints: [(glyph: Int, line: Int)] = []
+
+    /// 控えを取る間隔（表示行）
+    private let checkpointInterval = 500
+
     @objc func layoutChanged() {
+        // 編集された位置より後ろの控えは当てにならないので捨てる。
+        // 手前の控えは行番号が変わらないので残せる（先頭から数え直さずに済む）
+        let editPoint = textView?.selectedRange().location ?? 0
+        lineCheckpoints.removeAll { $0.glyph >= editPoint }
         updateThickness()
         needsDisplay = true
     }
@@ -131,23 +149,54 @@ final class LineNumberRulerView: NSRulerView {
     /// レイアウトを要求しない文字数ベースの概算に変更した（数字が数桁ずれても
     /// ガター幅が多少余分/不足するだけで実害はない。実際に描画する行番号自体は
     /// drawHashMarksAndLabels側で可視範囲のみを正確に計算している）。
+    private var cachedEstimate = 1
+    private var cachedLength = -1
+    private var cachedContainerWidth: CGFloat = -1
+
     private func estimatedDisplayLines() -> Int {
         guard let tv = textView else { return 1 }
-        let text = tv.string
-        guard !text.isEmpty else { return 1 }
+        let ns = tv.string as NSString
+        let length = ns.length          // NSStringの長さはO(1)
+        guard length > 0 else { return 1 }
+        let containerWidth = tv.textContainer?.size.width ?? 600
+
+        // この値はガター幅の**桁数**を決めるためだけに使う。1文字打つたびに
+        // 全文を数え直す意味はないので、長さが大きく変わったときだけ数え直す
+        if cachedLength >= 0,
+           abs(length - cachedLength) < 4096,
+           abs(containerWidth - cachedContainerWidth) < 1 {
+            return cachedEstimate
+        }
 
         var newlines = 0
-        for ch in text where ch == "\n" { newlines += 1 }
+        for u in tv.string.utf16 where u == 10 { newlines += 1 }
         let physicalLines = newlines + 1
 
         let font = tv.font ?? NSFont.systemFont(ofSize: 14)
         let charWidth = max(NSAttributedString(string: "全", attributes: [.font: font]).size().width, 1)
         let padding = tv.textContainer?.lineFragmentPadding ?? 0
-        let usableWidth = max((tv.textContainer?.size.width ?? 600) - padding * 2, charWidth)
+        let usableWidth = max(containerWidth - padding * 2, charWidth)
         let charsPerLine = max(Int(usableWidth / charWidth), 1)
-        let wrapEstimate = text.count / charsPerLine + 1
+        // text.count（書記素の数）は大きな文書で重いので、UTF-16の長さで見積もる
+        let wrapEstimate = length / charsPerLine + 1
 
-        return max(physicalLines, wrapEstimate, 1)
+        cachedLength = length
+        cachedContainerWidth = containerWidth
+        cachedEstimate = max(physicalLines, wrapEstimate, 1)
+        return cachedEstimate
+    }
+
+    /// 控えを位置順に保つ（同じ位置の重複は上書きする）
+    private func addCheckpoint(glyph: Int, line: Int) {
+        if let index = lineCheckpoints.firstIndex(where: { $0.glyph >= glyph }) {
+            if lineCheckpoints[index].glyph == glyph {
+                lineCheckpoints[index] = (glyph, line)
+            } else {
+                lineCheckpoints.insert((glyph, line), at: index)
+            }
+        } else {
+            lineCheckpoints.append((glyph, line))
+        }
     }
 
     private func updateThickness() {
@@ -184,15 +233,26 @@ final class LineNumberRulerView: NSRulerView {
             s.draw(at: NSPoint(x: x, y: y))
         }
 
-        // 文書先頭から可視範囲の直前までの表示行数を数える
+        // 可視範囲の直前までの表示行数を数える。
+        // 文書の先頭からではなく、**手前でいちばん近い控えから**再開する
         var line = 1
         var glyphIndex = 0
+        if let checkpoint = lineCheckpoints.last(where: { $0.glyph <= glyphRange.location }) {
+            line = checkpoint.line
+            glyphIndex = checkpoint.glyph
+        }
         var fragmentRange = NSRange()
+        var sinceCheckpoint = 0
         while glyphIndex < glyphRange.location {
             layoutManager.lineFragmentRect(forGlyphAt: glyphIndex, effectiveRange: &fragmentRange)
             if NSMaxRange(fragmentRange) > glyphRange.location { break }
             glyphIndex = NSMaxRange(fragmentRange)
             line += 1
+            sinceCheckpoint += 1
+            if sinceCheckpoint >= checkpointInterval {
+                sinceCheckpoint = 0
+                addCheckpoint(glyph: glyphIndex, line: line)
+            }
         }
 
         // 可視範囲の各表示行（折り返し行を含む）に行番号を描画
@@ -302,6 +362,14 @@ final class Document: NSDocument, NSTextViewDelegate {
     var fileEncoding: String.Encoding = .utf8
     var lineEnding: LineEnding = .lf
 
+    /// 読み込んだファイルの先頭に BOM（U+FEFF）があったか。
+    ///
+    /// BOM は文字コードの目印であって本文ではないので、**読み込んだ時点で外す**。
+    /// 外さないと目に見えない1文字が字数と原稿用紙換算に乗り、看板の数が狂う
+    /// （半角扱いなので0.5字ぶんずれる）。改行コードと同じく、
+    /// **元のファイルにあったなら保存時に書き戻す**ので、ファイルは変わらない。
+    var hadByteOrderMark = false
+
     private var autoSaveTimer: Timer?
     private var scheduledAutoSaveInterval: Double = -1
 
@@ -313,6 +381,9 @@ final class Document: NSDocument, NSTextViewDelegate {
     private weak var modeButton: NSButton?
     private weak var menuBarView: MenuBarView?
     private var matchListController: MatchListWindowController?
+    private var statusUpdateTimer: Timer?
+    private var proofListController: ProofListWindowController?
+    private var outlineController: OutlineWindowController?
 
     // 外部変更の競合検出・大幅変更ガードの基準値（Android版のTabが持つ値と同じ）
     private var baseModified: Date?
@@ -341,6 +412,8 @@ final class Document: NSDocument, NSTextViewDelegate {
                 NSLocalizedDescriptionKey: "テキストを読み込めませんでした（UTF-8 / Shift-JIS のいずれでもありません）。",
             ])
         }
+        hadByteOrderMark = text.hasPrefix("\u{FEFF}")
+        if hadByteOrderMark { text.removeFirst() }
         lineEnding = text.contains("\r\n") ? .crlf : .lf
         text = text
             .replacingOccurrences(of: "\r\n", with: "\n")
@@ -369,9 +442,11 @@ final class Document: NSDocument, NSTextViewDelegate {
 
     override func data(ofType typeName: String) throws -> Data {
         if let tv = textView { text = tv.string }
-        let out = lineEnding == .crlf
+        var out = lineEnding == .crlf
             ? text.replacingOccurrences(of: "\n", with: "\r\n")
             : text
+        // 元のファイルにあった BOM は書き戻す（勝手に落とさない）
+        if hadByteOrderMark { out = "\u{FEFF}" + out }
         guard let data = out.data(using: fileEncoding, allowLossyConversion: false) else {
             throw NSError(domain: "KageriEditor", code: 11, userInfo: [
                 NSLocalizedDescriptionKey: "Shift-JIS では表現できない文字が含まれているため保存できません。エンコーディングを UTF-8 に変更するか、該当の文字を修正してください。",
@@ -1239,7 +1314,19 @@ final class Document: NSDocument, NSTextViewDelegate {
         v == v.rounded() ? String(Int(v)) : String(format: "%.1f", v)
     }
 
+    /// 本文が変わるたびに全文を数え直すと大きな文書で入力が追いつかなくなるので、
+    /// 少し待ってからまとめて数える。保存やタブ切替など、すぐ反映したい経路は
+    /// updateStatus() を直接呼ぶ（Android版2.15と同じ考え方）。
+    func scheduleStatusUpdate() {
+        statusUpdateTimer?.invalidate()
+        statusUpdateTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: false) { [weak self] _ in
+            self?.updateStatus()
+        }
+    }
+
     func updateStatus() {
+        statusUpdateTimer?.invalidate()
+        statusUpdateTimer = nil
         guard let tv = textView else { return }
         let string = tv.string
         // 表示行数（折り返し込み）ではなく物理行数（改行の数）を数える。
@@ -1247,14 +1334,23 @@ final class Document: NSDocument, NSTextViewDelegate {
         // 発生し、大きな文書で毎回のステータス更新のたびに重くなる・過去に
         // 無限再帰でクラッシュした原因そのものになるため（LineNumberRulerViewの
         // estimatedDisplayLines()と同じ理由）、あえて正確な表示行数は数えない。
+        //
+        // 字数・原稿用紙の行数・改行の数は**1回の走査でまとめて**求める。
+        // 以前は3回別々に走査したうえ、manuscriptLinesが全行を配列に確保していた
         var lines = 1
         for u in string.utf16 where u == 10 { lines += 1 }
-        let sheets = formatCount(CharWidth.manuscriptSheets(string))
-        var status = "\(lines) 行 ｜ \(formatCount(CharWidth.zenkakuCount(string))) 字 ｜ \(sheets) 枚"
+        let metrics = CharWidth.measure(string, excludeHeadingMarks: true)
+        let sheets = formatCount((Double(metrics.manuscriptLines) / 20 * 10).rounded(.down) / 10)
+        var status = "\(lines) 行 ｜ \(formatCount(metrics.zenkaku)) 字 ｜ \(sheets) 枚"
+        // 見出しの印を数から除いていることは、ステータスバーには出さない
+        // （除く決まりは使い方に書いてあり、入稿前に「見出しの印をすべて外す」を
+        // 通せば、画面の数と渡したファイルの数は完全に一致する）
         let sel = tv.selectedRange()
         if sel.length > 0 {
+            // 全体と選択で数え方が違うと説明がつかないので、選択も同じに数える
             let selected = (string as NSString).substring(with: sel)
-            status += "（選択 \(formatCount(CharWidth.zenkakuCount(selected))) 字）"
+            let selMetrics = CharWidth.measure(selected, excludeHeadingMarks: true)
+            status += "（選択 \(formatCount(selMetrics.zenkaku)) 字）"
         }
         statusLabel?.stringValue = status
         syncAutoSavePopup()
@@ -1300,11 +1396,13 @@ final class Document: NSDocument, NSTextViewDelegate {
     func undoManager(for view: NSTextView) -> UndoManager? { undoManager }
 
     func textDidChange(_ notification: Notification) {
-        updateStatus()
+        scheduleStatusUpdate()
     }
 
     func textViewDidChangeSelection(_ notification: Notification) {
-        updateStatus()
+        // カーソルを動かしただけでも呼ばれる。大きな文書では矢印キーの1回ごとに
+        // 全文を数え直すことになるので、こちらも間引く
+        scheduleStatusUpdate()
     }
 
     // ---------- エンコーディング / 改行コード ----------
@@ -1411,6 +1509,7 @@ final class Document: NSDocument, NSTextViewDelegate {
         let removeTab = check("タブ", "assistRemoveTab")
         let removeIndent = check("行頭の字下げも除去する", "assistRemoveIndent")
         let digits = check("数字を半角に", "assistDigits")
+        let units = check("単位を半角に（km・L など）", "assistUnits")
         let addIndent = check("行頭の字下げ（一字下げ）", "assistAddIndent")
         let addBlank = check("段落の間に空行", "assistAddBlank")
 
@@ -1444,6 +1543,8 @@ final class Document: NSDocument, NSTextViewDelegate {
             indented(removeIndent, by: 12),
             heading("文字種を揃える"),
             indented(digits, by: 12),
+            indented(units, by: 12),
+            indented(note("数字のすぐ後ろにある単位だけを半角にします。アルファベットの変換より後に効くので、「全角に」と一緒に選べば「単語は全角・単位は半角」にできます。"), by: 32),
             indented(NSTextField(labelWithString: "アルファベット"), by: 12),
             indented(alphabetRow, by: 32),
             heading("追加する"),
@@ -1468,7 +1569,7 @@ final class Document: NSDocument, NSTextViewDelegate {
         ])
         container.frame = NSRect(x: 0, y: 0, width: assistDialogWidth, height: stack.fittingSize.height)
 
-        let checkBoxes = [removeHalf, removeFull, removeTab, removeIndent, digits, addIndent, addBlank]
+        let checkBoxes = [removeHalf, removeFull, removeTab, removeIndent, digits, units, addIndent, addBlank]
         Document.assistDialogControls = (checkBoxes, [alphaKeep, alphaFull, alphaHalf])
         defer { Document.assistDialogControls = nil }
 
@@ -1496,6 +1597,7 @@ final class Document: NSDocument, NSTextViewDelegate {
         defaults.set(removeTab.state == .on, forKey: "assistRemoveTab")
         defaults.set(removeIndent.state == .on, forKey: "assistRemoveIndent")
         defaults.set(digits.state == .on, forKey: "assistDigits")
+        defaults.set(units.state == .on, forKey: "assistUnits")
         defaults.set(addIndent.state == .on, forKey: "assistAddIndent")
         defaults.set(addBlank.state == .on, forKey: "assistAddBlank")
         switch alphabet {
@@ -1511,6 +1613,7 @@ final class Document: NSDocument, NSTextViewDelegate {
             removeLeadingIndent: removeIndent.state == .on,
             digitsToHalfWidth: digits.state == .on,
             alphabet: alphabet,
+            unitsToHalfWidth: units.state == .on,
             addLeadingIndent: addIndent.state == .on,
             addBlankLines: addBlank.state == .on
         )
@@ -1537,6 +1640,74 @@ final class Document: NSDocument, NSTextViewDelegate {
 
     /// ラジオボタンを排他にするためだけのアクション（値は「実行」時にまとめて読む）
     @objc private func assistAlphabetChanged(_ sender: NSButton) {}
+
+    /// 推敲。書き上げた原稿の「気になる箇所」を並べる。**直さず、指摘するだけ**。
+    /// 原稿支援と違って本文を書き換えないので、ダイアログで選ばせず即座に一覧を出す。
+    /// 選択範囲があればその範囲だけを見る（整形・原稿支援と同じ扱い）。
+    @objc func proofreadCommand(_ sender: Any?) {
+        guard let tv = textView else { return }
+        guard let controller = ProofListWindowController(textView: tv) else {
+            let alert = NSAlert()
+            alert.messageText = tv.selectedRange().length > 0
+                ? "選択範囲に気になる箇所はありません"
+                : "気になる箇所は見つかりませんでした"
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+        proofListController = controller
+        controller.shouldCascadeWindows = false
+        controller.window?.center()
+        controller.showWindow(nil)
+    }
+
+    /// 見出しを拾って並べ、クリックでその場所へ移動する。**本文には触れない**。
+    @objc func outlineCommand(_ sender: Any?) {
+        guard let tv = textView else { return }
+        guard let controller = OutlineWindowController(textView: tv) else {
+            let alert = NSAlert()
+            alert.messageText = "見出しが見つかりませんでした"
+            alert.informativeText = "行頭が字下げされておらず、句点で終わらない短い行を見出しとみなします。"
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+        outlineController = controller
+        controller.shouldCascadeWindows = false
+        controller.window?.center()
+        controller.showWindow(nil)
+    }
+
+    // ---------- 見出しの印 ----------
+
+    /// 見出しの印を1段送る（なし → 大見出し → 小見出し → なし）。
+    ///
+    /// 印は行頭の「# 」「## 」で、**字数と原稿用紙換算からは除かれる**
+    /// （印は原稿ではなく書き手の道具なので）。印のある文書では、見出しの推定を
+    /// やめて印だけに従うので、並べ替えのように間違えると被害の大きい操作を
+    /// 安心して載せられる。
+    ///
+    /// 書き換えるのは**かかった行だけ**で、全文は作り直さない。1回の書き換えに
+    /// まとめているので、取り消しも1回で戻る。
+    @objc func headingMarkCommand(_ sender: Any?) {
+        guard let tv = textView else { return }
+        let sel = tv.selectedRange()
+        guard let patch = Outline.cycleMarkPatch(
+            tv.string, selStart: sel.location, selEnd: NSMaxRange(sel)) else { return }
+        let range = NSRange(location: patch.start, length: patch.end - patch.start)
+        tv.insertText(patch.replacement, replacementRange: range)
+        let newLength = (tv.string as NSString).length
+        let start = min(patch.selStart, newLength)
+        tv.setSelectedRange(
+            NSRange(location: start, length: min(patch.selEnd, newLength) - start))
+        updateStatus()
+    }
+
+    /// 印をすべて外す。入稿の直前に使う。
+    /// これを通したファイルなら、画面の字数と受け取った側で数えた字数が一致する。
+    @objc func stripHeadingMarksCommand(_ sender: Any?) {
+        applyTransform { Outline.stripMarks($0) }
+    }
 
     /// 改行のみの行を1段階ぶん削除する（連続する空行は1回につき1行ずつ詰まる）
     @objc func removeBlankLinesCommand(_ sender: Any?) {
@@ -1654,6 +1825,9 @@ final class Document: NSDocument, NSTextViewDelegate {
             "removenl": { [weak self] in self?.removeNewlinesCommand(nil) },
             "blankline": { [weak self] in self?.removeBlankLinesCommand(nil) },
             "removespace": { [weak self] in self?.manuscriptAssistCommand(nil) },
+            "proofread": { [weak self] in self?.proofreadCommand(nil) },
+            "outline": { [weak self] in self?.outlineCommand(nil) },
+            "headingmark": { [weak self] in self?.headingMarkCommand(nil) },
             "close": { [weak self] in self?.closeSavingFirst(nil) },
         ]
     }
@@ -1756,6 +1930,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         UserDefaults.standard.register(defaults: [
             "wrapWidth": 40,
             "fontSize": 16.0,
+            "listFontSize": 12.0, // 検索結果一覧・推敲・目次の一覧に使う文字サイズ
             "showInvisibles": true,
             "autoSaveInterval": 0.0, // 分。0 で無効（既定はオフ）
             "dateFormat": 0,
@@ -1803,7 +1978,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     @objc func showPreferences(_ sender: Any?) {
         if preferencesPanel == nil {
             let panel = NSPanel(
-                contentRect: NSRect(x: 0, y: 0, width: 460, height: 408),
+                contentRect: NSRect(x: 0, y: 0, width: 520, height: 440),
                 styleMask: [.titled, .closable],
                 backing: .buffered, defer: false)
             panel.title = "設定"
@@ -1861,6 +2036,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             let fontSizeRow = NSStackView(views: [fontSizeTitle, fontSizeField, fontSizeStepper])
             fontSizeRow.orientation = .horizontal
             fontSizeRow.spacing = 8
+
+            // --- 一覧の文字サイズ（検索結果一覧・推敲・目次）。
+            //     本文とは別に持つ。一覧は補助的な表示なので本文と同じ大きさに
+            //     すると場所を取りすぎるが、画面によっては既定の12ptが小さい ---
+            let listFontTitle = NSTextField(labelWithString: "一覧の文字サイズ:")
+
+            let listFontFormatter = NumberFormatter()
+            listFontFormatter.allowsFloats = false
+            listFontFormatter.minimum = 9
+            listFontFormatter.maximum = 36
+
+            let listFontField = NSTextField()
+            listFontField.formatter = listFontFormatter
+            listFontField.alignment = .right
+            listFontField.bind(.value,
+                               to: NSUserDefaultsController.shared,
+                               withKeyPath: "values.listFontSize",
+                               options: [.continuouslyUpdatesValue: true])
+            listFontField.widthAnchor.constraint(equalToConstant: 50).isActive = true
+
+            let listFontStepper = NSStepper()
+            listFontStepper.minValue = 9
+            listFontStepper.maxValue = 36
+            listFontStepper.increment = 1
+            listFontStepper.valueWraps = false
+            listFontStepper.bind(.value,
+                                 to: NSUserDefaultsController.shared,
+                                 withKeyPath: "values.listFontSize",
+                                 options: [.continuouslyUpdatesValue: true])
+
+            let listFontNote = NSTextField(labelWithString: "（検索結果一覧・推敲・目次）")
+            listFontNote.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
+            listFontNote.textColor = .secondaryLabelColor
+
+            let listFontRow = NSStackView(views: [listFontTitle, listFontField, listFontStepper, listFontNote])
+            listFontRow.orientation = .horizontal
+            listFontRow.spacing = 8
 
             // --- 整形の文字数 ---
             let wrapTitle = NSTextField(labelWithString: "整形の文字数（全角換算）:")
@@ -1997,7 +2209,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             // （設定パネルが長くなりすぎるのを避けるため。2026-07-19、ユーザー指示）。
 
             let stack = NSStackView(views: [
-                folderRow, fontSizeRow, wrapRow, noParagraphRow,
+                folderRow, fontSizeRow, listFontRow, wrapRow, noParagraphRow,
                 tabsRow,
                 darkModeTitle, darkModeRow,
                 printFontRow, autoSaveRow, dateRow, timeRow, menuEditRow,
@@ -2156,6 +2368,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             Ctrl+E　整形
             Ctrl+L　空行除去（連続する空行は1回に1行ずつ）
             Ctrl+K　原稿支援
+            Ctrl+J　推敲
+            Ctrl+U　目次
+            Ctrl+H　見出しの印を送る（なし→大見出し→小見出し→なし）
             Ctrl+B　閲覧モードの切替
             Ctrl+;　日付を挿入
             Ctrl+Shift+;　時刻を挿入
@@ -2443,6 +2658,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         assistShift.keyEquivalentModifierMask = [.control, .shift]
         assistShift.isHidden = true
         assistShift.allowsKeyEquivalentWhenHidden = true
+
+        let proofread = editMenu.addItem(withTitle: "推敲…",
+                                         action: #selector(Document.proofreadCommand(_:)),
+                                         keyEquivalent: "j")
+        proofread.keyEquivalentModifierMask = [.control]
+        let proofreadShift = editMenu.addItem(withTitle: "推敲…",
+                                              action: #selector(Document.proofreadCommand(_:)),
+                                              keyEquivalent: "j")
+        proofreadShift.keyEquivalentModifierMask = [.control, .shift]
+        proofreadShift.isHidden = true
+        proofreadShift.allowsKeyEquivalentWhenHidden = true
+
+        let outline = editMenu.addItem(withTitle: "目次…",
+                                       action: #selector(Document.outlineCommand(_:)),
+                                       keyEquivalent: "u")
+        outline.keyEquivalentModifierMask = [.control]
+        let outlineShift = editMenu.addItem(withTitle: "目次…",
+                                            action: #selector(Document.outlineCommand(_:)),
+                                            keyEquivalent: "u")
+        outlineShift.keyEquivalentModifierMask = [.control, .shift]
+        outlineShift.isHidden = true
+        outlineShift.allowsKeyEquivalentWhenHidden = true
+
+        // Ctrl+D は履歴で使っている。見出しの印は「見出し／Heading」で Ctrl+H
+        let headingMark = editMenu.addItem(withTitle: "見出しの印を送る",
+                                           action: #selector(Document.headingMarkCommand(_:)),
+                                           keyEquivalent: "h")
+        headingMark.keyEquivalentModifierMask = [.control]
+        let headingMarkShift = editMenu.addItem(withTitle: "見出しの印を送る",
+                                                action: #selector(Document.headingMarkCommand(_:)),
+                                                keyEquivalent: "h")
+        headingMarkShift.keyEquivalentModifierMask = [.control, .shift]
+        headingMarkShift.isHidden = true
+        headingMarkShift.allowsKeyEquivalentWhenHidden = true
+
+        editMenu.addItem(withTitle: "見出しの印をすべて外す",
+                         action: #selector(Document.stripHeadingMarksCommand(_:)),
+                         keyEquivalent: "")
 
         let dateItem = editMenu.addItem(withTitle: "日付を挿入",
                                         action: #selector(Document.insertDateCommand(_:)),
