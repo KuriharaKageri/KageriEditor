@@ -24,6 +24,8 @@ swiftc -O \
     Sources/DocumentSafety.swift \
     Sources/ToolbarMenu.swift \
     Sources/SearchMatchList.swift \
+    Sources/MarkdownPreview.swift \
+    Sources/MarkdownPreviewRenderer.swift \
     Sources/main.swift
 swiftc -O \
     -module-name KageriEditor \
@@ -38,6 +40,8 @@ swiftc -O \
     Sources/DocumentSafety.swift \
     Sources/ToolbarMenu.swift \
     Sources/SearchMatchList.swift \
+    Sources/MarkdownPreview.swift \
+    Sources/MarkdownPreviewRenderer.swift \
     Sources/main.swift
 lipo -create \
     "$BUNDLE/Contents/MacOS/$APP_NAME.arm64" \

@@ -607,6 +607,56 @@ enum TextTransform {
 
 
 // ============================================================
+// 原稿支援のプリセット（Android版2.31と同じ考え方）
+// ============================================================
+
+/// 原稿支援ダイアログの8項目のチェック状態に名前を付けて保存したもの
+struct AssistPreset: Codable, Equatable {
+    var name: String
+    var removeHalf: Bool
+    var removeFull: Bool
+    var removeTab: Bool
+    var removeIndent: Bool
+    var digits: Bool
+    var units: Bool
+    var addIndent: Bool
+    var addBlank: Bool
+    /// "keep" / "full" / "half"
+    var alphabet: String
+}
+
+/// プリセットの読み書き。JSON文字列としてprefsに1本で持つ（Android版のassistPresetsと同じ形）。
+/// エンコード・デコードはUserDefaultsから切り離した純粋関数にして単体テストできるようにしている
+enum AssistPresetStore {
+    static func encode(_ presets: [AssistPreset]) -> String {
+        guard let data = try? JSONEncoder().encode(presets),
+              let json = String(data: data, encoding: .utf8) else { return "[]" }
+        return json
+    }
+
+    static func decode(_ json: String?) -> [AssistPreset] {
+        guard let json, let data = json.data(using: .utf8),
+              let presets = try? JSONDecoder().decode([AssistPreset].self, from: data) else { return [] }
+        return presets
+    }
+
+    /// 同名があれば上書き、無ければ末尾に追加した配列を返す（保存側の呼び出し元でJSON化する）
+    static func upserted(_ presets: [AssistPreset], with preset: AssistPreset) -> [AssistPreset] {
+        var result = presets
+        if let index = result.firstIndex(where: { $0.name == preset.name }) {
+            result[index] = preset
+        } else {
+            result.append(preset)
+        }
+        return result
+    }
+
+    static func removed(_ presets: [AssistPreset], name: String) -> [AssistPreset] {
+        presets.filter { $0.name != name }
+    }
+}
+
+// ============================================================
 // 1行目からのファイル名生成
 // ============================================================
 enum FileNaming {
@@ -647,5 +697,26 @@ enum FileNaming {
         while name.hasPrefix(".") { name.removeFirst() }
         if name.isEmpty { name = "無題" }
         return name
+    }
+
+    /// 新しく作る文書は必ずこの拡張子（原則）
+    static let defaultExtension = "txt"
+    /// ピッカー・ファイル名変更で明示的に指定できる拡張子
+    static let knownExtensions: Set<String> = ["txt", "md"]
+
+    /// ファイル名変更で入力された文字列から、拡張子込みで書かれていれば
+    /// それを解釈する。既知の拡張子（txt/md）ならその拡張子を切り出し、
+    /// 知らない拡張子（や拡張子なし）は全体を題名の一部とみなしてfallbackを補う
+    /// （「第3章.決意」→「第3章.決意.txt」のようになる。Android版と同じ規則）
+    static func withExtension(typed: String, fallback: String = defaultExtension) -> (base: String, ext: String) {
+        guard let dot = typed.lastIndex(of: "."), typed.index(after: dot) < typed.endIndex else {
+            return (typed, fallback)
+        }
+        let base = String(typed[typed.startIndex..<dot])
+        let ext = String(typed[typed.index(after: dot)...]).lowercased()
+        guard !base.isEmpty, knownExtensions.contains(ext) else {
+            return (typed, fallback)
+        }
+        return (base, ext)
     }
 }

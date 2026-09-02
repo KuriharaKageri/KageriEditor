@@ -506,6 +506,9 @@ enum ProofCheck {
         var formal = false
         /// 仮名側の直前にこの文字があれば数えない（「という」の「いう」など）
         var kanaNotAfter = ""
+        /// 漢字側の直前にこの文字があれば数えない。「変更に」は「更に」を部分文字列として
+        /// 含んでしまうので、「更」の直前が「変」なら複合語（変更）とみなして除く
+        var kanjiNotAfter = ""
         /// 直前に来てよい文字を絞る（空なら平仮名すべて）。
         /// 「もの」は慣用的な用法が多いので連体形の語尾に限る
         var precededBy = ""
@@ -538,7 +541,7 @@ enum ProofCheck {
         VariantPair(kanji: "初めて", kana: "はじめて"),
         VariantPair(kanji: "全て", kana: "すべて"),
         VariantPair(kanji: "既に", kana: "すでに"),
-        VariantPair(kanji: "更に", kana: "さらに"),
+        VariantPair(kanji: "更に", kana: "さらに", kanjiNotAfter: "変"),
         VariantPair(kanji: "特に", kana: "とくに"),
         VariantPair(kanji: "殆ど", kana: "ほとんど"),
         VariantPair(kanji: "但し", kana: "ただし"),
@@ -557,7 +560,7 @@ enum ProofCheck {
         var findings: [Finding] = []
         for pair in variantPairs {
             let kanjiHits = occurrences(chars, Array(pair.kanji), pair.formal, kanjiSide: true,
-                                        notAfter: "", precededBy: pair.precededBy,
+                                        notAfter: pair.kanjiNotAfter, precededBy: pair.precededBy,
                                         notBefore: pair.notBefore)
             let kanaHits = occurrences(chars, Array(pair.kana), pair.formal, kanjiSide: false,
                                        notAfter: pair.kanaNotAfter, precededBy: pair.precededBy,

@@ -143,6 +143,17 @@ final class LineNumberRulerView: NSRulerView {
         needsDisplay = true
     }
 
+    /// 文字の入力を伴わない変更（閲覧モードのMarkdownプレビューの適用・解除など）で
+    /// 行の高さが変わったあとに呼ぶ。カーソル位置とは無関係に文書のどこでも
+    /// 高さが変わりうるため、`layoutChanged()` と違って控えを全部捨てる
+    /// （そのままだと、控えを取った位置より前で高さが変わった場合に行番号がずれる）
+    func invalidateAllLayout() {
+        lineCheckpoints.removeAll()
+        cachedLength = -1
+        updateThickness()
+        needsDisplay = true
+    }
+
     /// 文書全体の表示行数の見積もり（ガター幅の桁数を決めるためだけに使う）。
     /// TextKitのlineFragmentRectを全文書に対して呼ぶと文書全体のレイアウトが
     /// 強制され、大きな文書を開くたびに固まる原因になっていたため、実際の
@@ -395,6 +406,11 @@ final class Document: NSDocument, NSTextViewDelegate {
     private var conflictAlertShowing = false
     /// 閲覧モード（読むことに専念するモード。起動のたびに解除された状態から始まる）
     private var readingMode = false
+    private let markdownRenderer = MarkdownPreviewRenderer()
+    /// 閲覧モード中、字数と原稿用紙の枚数を伏せているか。
+    /// よそのMarkdownは原稿ではないので枚数に意味がなく、`**` のような記法も1文字として
+    /// 数えてしまうため、数字を出すと分量を読み違える。数え方は変えずに黙る側へ倒している
+    private var readingHidesCount = false
 
     override class var autosavesInPlace: Bool { false }
 
@@ -423,14 +439,7 @@ final class Document: NSDocument, NSTextViewDelegate {
         if let tv = textView {
             tv.string = text
             syncPopups()
-            // 前回終了時のカーソル位置を復元する（記録が無い、または文書が短くなっていれば先頭）
-            if let url = fileURL {
-                let pos = RecentHistory.position(for: url)
-                let len = (tv.string as NSString).length
-                let start = min(max(pos.selStart, 0), len)
-                let end = min(max(pos.selEnd, start), len)
-                tv.setSelectedRange(NSRange(location: start, length: end - start))
-            }
+            restoreCursorPosition()
             updateStatus()
         }
 
@@ -438,6 +447,22 @@ final class Document: NSDocument, NSTextViewDelegate {
             recordBaseline(at: url)
             addHistory(name: url.lastPathComponent, url: url)
         }
+    }
+
+    /// 前回終了時のカーソル位置を復元する（記録が無い、または文書が短くなっていれば先頭）。
+    ///
+    /// **新規に開いた時（revertではない最初のmakeWindowControllers）は、
+    /// read(from:ofType:)の時点ではまだtextViewが存在しないため、ここが呼ばれる前は
+    /// 一度も呼ばれていなかった。** その結果、NSTextViewの既定の選択範囲（文末）が
+    /// そのまま残り、カーソルは文末にあるのに画面は先頭付近を表示する、という
+    /// ちぐはぐな状態になっていた。
+    private func restoreCursorPosition() {
+        guard let tv = textView, let url = fileURL else { return }
+        let pos = RecentHistory.position(for: url)
+        let len = (tv.string as NSString).length
+        let start = min(max(pos.selStart, 0), len)
+        let end = min(max(pos.selEnd, start), len)
+        tv.setSelectedRange(NSRange(location: start, length: end - start))
     }
 
     override func data(ofType typeName: String) throws -> Data {
@@ -559,7 +584,7 @@ final class Document: NSDocument, NSTextViewDelegate {
     }
 
     /// 未保存の文書を、指定した名前で保存フォルダに新規保存する（「名前を変更」から使用）
-    private func saveWithExplicitName(base: String) {
+    private func saveWithExplicitName(base: String, ext: String) {
         let folder = Document.saveFolderURL
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -567,10 +592,10 @@ final class Document: NSDocument, NSTextViewDelegate {
             presentError(error)
             return
         }
-        var target = folder.appendingPathComponent(base).appendingPathExtension("txt")
+        var target = folder.appendingPathComponent(base).appendingPathExtension(ext)
         var n = 2
         while FileManager.default.fileExists(atPath: target.path) {
-            target = folder.appendingPathComponent("\(base) \(n)").appendingPathExtension("txt")
+            target = folder.appendingPathComponent("\(base) \(n)").appendingPathExtension(ext)
             n += 1
         }
         save(to: target, ofType: documentFileType, for: .saveAsOperation) { [weak self] error in
@@ -698,15 +723,19 @@ final class Document: NSDocument, NSTextViewDelegate {
         }
     }
 
-    /// 現在の内容を「元名_競合コピー_日時.txt」として保存フォルダに保存する
+    /// 現在の内容を「元名_競合コピー_日時.拡張子」として保存フォルダに保存する。
+    /// 拡張子は既存ファイル由来の操作なので、元のファイルのものを引き継ぐ
+    /// （新規作成と違い、名前を変えただけで種類が変わるのは驚きが大きいため）
     private func saveAsConflictCopy() {
         if let tv = textView { text = tv.string }
         let folder = fileURL?.deletingLastPathComponent() ?? Document.saveFolderURL
         let baseName = fileURL?.deletingPathExtension().lastPathComponent ?? "無題"
+        let ext = fileURL.map { $0.pathExtension.isEmpty ? FileNaming.defaultExtension : $0.pathExtension.lowercased() }
+            ?? FileNaming.defaultExtension
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyyMMdd_HHmmss"
         let stamp = formatter.string(from: Date())
-        let target = folder.appendingPathComponent("\(baseName)_競合コピー_\(stamp)").appendingPathExtension("txt")
+        let target = folder.appendingPathComponent("\(baseName)_競合コピー_\(stamp)").appendingPathExtension(ext)
         conflictHold = false
         save(to: target, ofType: documentFileType, for: .saveAsOperation) { [weak self] error in
             guard let self else { return }
@@ -740,15 +769,19 @@ final class Document: NSDocument, NSTextViewDelegate {
     @objc func renameCommand(_ sender: Any?) {
         guard let tv = textView, let window = windowControllers.first?.window else { return }
         let sel = tv.selectedRange()
-        var suggested = fileURL?.deletingPathExtension().lastPathComponent ?? "無題"
+        let currentExt = fileURL.map { $0.pathExtension.isEmpty ? FileNaming.defaultExtension : $0.pathExtension.lowercased() }
+            ?? FileNaming.defaultExtension
+        var suggestedBase = fileURL?.deletingPathExtension().lastPathComponent ?? "無題"
         if sel.length > 0 {
             let selected = (tv.string as NSString).substring(with: sel)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            if !selected.isEmpty { suggested = FileNaming.fileName(fromFirstLineOf: selected) }
+            if !selected.isEmpty { suggestedBase = FileNaming.fileName(fromFirstLineOf: selected) }
         }
 
+        // 拡張子込みで表示・編集できるようにする。既知の拡張子（txt/md）に
+        // 書き換えれば、そのファイルの種類ごと変えられる（Android版と同じ規則）
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
-        field.stringValue = suggested
+        field.stringValue = "\(suggestedBase).\(currentExt)"
 
         let alert = NSAlert()
         alert.messageText = "ファイル名を変更"
@@ -759,18 +792,19 @@ final class Document: NSDocument, NSTextViewDelegate {
         alert.window.initialFirstResponder = field
         alert.beginSheetModal(for: window) { [weak self] response in
             guard let self, response == .alertFirstButtonReturn else { return }
-            let base = FileNaming.fileName(fromFirstLineOf: field.stringValue)
-            self.performRename(base: base)
+            let (typedBase, ext) = FileNaming.withExtension(typed: field.stringValue, fallback: currentExt)
+            let base = FileNaming.fileName(fromFirstLineOf: typedBase)
+            self.performRename(base: base, ext: ext)
         }
     }
 
-    private func performRename(base: String) {
+    private func performRename(base: String, ext: String) {
         guard let oldURL = fileURL else {
             // 未保存の文書は、この名前で新規保存する
-            saveWithExplicitName(base: base)
+            saveWithExplicitName(base: base, ext: ext)
             return
         }
-        let newName = "\(base).\(oldURL.pathExtension)"
+        let newName = "\(base).\(ext)"
         guard newName != oldURL.lastPathComponent else { return }
         let folder = oldURL.deletingLastPathComponent()
         let newURL = folder.appendingPathComponent(newName)
@@ -893,15 +927,34 @@ final class Document: NSDocument, NSTextViewDelegate {
         window.tabbingMode = tabsEnabled ? .preferred : .disallowed
         if tabsEnabled {
             // 「開く」（NSOpenPanelが閉じた直後）はmacOSの自動タブ合流が効かないことが
-            // あるため、既存のドキュメントウインドウのタブグループへ明示的に合流させる
+            // あるため、既存のドキュメントウインドウのタブグループへ明示的に合流させる。
+            //
+            // addTabbedWindow・toggleTabBarはどちらも、すでに開いている側のウインドウの
+            // 枠をAppKitが内部で動かしてしまうことがある（新規作成のたびに位置や大きさが
+            // 少しずつ変わって見える不具合の原因）。「すでに1つでも開いていれば絶対に
+            // 動かさない・大きさも変えない」という方針のため、合流前後で他ウインドウの
+            // 枠を控えておき、変わっていれば強制的に戻す
             if let other = Document.anotherVisibleDocumentWindow(excluding: window),
                other.tabGroup !== window.tabGroup {
+                let keepFrame = other.frame
                 other.addTabbedWindow(window, ordered: .above)
+                if other.frame != keepFrame {
+                    other.setFrame(keepFrame, display: false)
+                }
+                if window.frame != keepFrame {
+                    window.setFrame(keepFrame, display: false)
+                }
             }
         }
         let barVisible = window.tabGroup?.isTabBarVisible ?? false
         if barVisible != tabsEnabled {
+            let othersBefore = (window.tabGroup?.windows ?? [])
+                .filter { $0 !== window }
+                .map { ($0, $0.frame) }
             window.toggleTabBar(nil)
+            for (other, keepFrame) in othersBefore where other.frame != keepFrame {
+                other.setFrame(keepFrame, display: false)
+            }
         }
     }
 
@@ -949,10 +1002,13 @@ final class Document: NSDocument, NSTextViewDelegate {
     override func saveAs(_ sender: Any?) {
         guard let window = windowControllers.first?.window else { return }
         let panel = NSSavePanel()
-        panel.allowedContentTypes = [.plainText]
+        // 既存ファイルの拡張子（txt/md）をそのまま候補にする。新規文書は原則どおりtxt
+        let ext = fileURL.map { $0.pathExtension.isEmpty ? FileNaming.defaultExtension : $0.pathExtension.lowercased() }
+            ?? FileNaming.defaultExtension
+        panel.allowedContentTypes = [UTType(filenameExtension: ext) ?? .plainText, .plainText]
         panel.canCreateDirectories = true
         panel.directoryURL = fileURL?.deletingLastPathComponent() ?? Document.saveFolderURL
-        panel.nameFieldStringValue = currentAutoFileName() + ".txt"
+        panel.nameFieldStringValue = currentAutoFileName() + "." + ext
         panel.beginSheetModal(for: window) { response in
             guard response == .OK, let url = panel.url else { return }
             self.save(to: url, ofType: self.documentFileType, for: .saveAsOperation) { error in
@@ -1046,8 +1102,15 @@ final class Document: NSDocument, NSTextViewDelegate {
         // その一瞬のフレーム不一致のせいで毎回位置がずれて見える問題も同時に防げる。
         // 1つも開いていない時（全部閉じたあとの「新規」やアプリ起動直後）は、
         // 最後に使っていた枠を覚えているのでそこへ開く。覚えていなければ中央。
+        let tabsEnabled = UserDefaults.standard.bool(forKey: "tabsEnabled")
         if let existing = Document.anotherVisibleDocumentWindow(excluding: window) {
-            window.setFrame(existing.frame, display: false)
+            // タブでまとめる設定の時は、あとでタブへ合流させるため既存ウインドウの枠へ
+            // 正確に合わせる（合流時、既存ウインドウ側は絶対に動かさない・大きさも変えない）。
+            // タブを使わない設定の時は、ぴったり重ねると別ファイルが開いたことに
+            // 気づきにくいので、定番のカスケードと同じ向き（右へ・下へ）に少しずらす
+            window.setFrame(
+                tabsEnabled ? existing.frame : Document.cascadedFrame(from: existing.frame),
+                display: false)
         } else if let remembered = Document.lastWindowFrame() {
             window.setFrame(remembered, display: false)
         } else {
@@ -1257,7 +1320,24 @@ final class Document: NSDocument, NSTextViewDelegate {
         // （Android版のタブ再利用と同じ考え方）。上のタブ合流より後に行うことで、
         // 「名称未設定」を閉じる際のちらつきが新規ウインドウの表示に重ならないようにする
         closeOtherBlankUntitledDocuments()
+        // read(from:ofType:)の時点ではまだtextViewが無いため、新規に開いた時の
+        // カーソル復元はここで行う（revert時はread側で既に行っている）
+        restoreCursorPosition()
         window.makeFirstResponder(tv)
+        // ファイルを開いた直後、カーソル位置（前回終了時の続き、または先頭）が
+        // 画面外のままになることがあった（例えば1行目が隠れて2行目から表示される）。
+        // タブ合流などでまだ枠組みが落ち着いていないことがあるため、次の実行ループで
+        // 改めてカーソルを画面内へ入れる（閲覧モードの往復と同じ理由・同じ直し方）
+        DispatchQueue.main.async { [weak tv] in
+            guard let tv else { return }
+            tv.window?.layoutIfNeeded()
+            let sel = tv.selectedRange()
+            if sel.location <= 0 {
+                tv.scrollToBeginningOfDocument(nil)
+            } else {
+                tv.scrollRangeToVisible(sel)
+            }
+        }
 
         syncPopups()
         updateStatus()
@@ -1297,6 +1377,18 @@ final class Document: NSDocument, NSTextViewDelegate {
             return overlap.width >= 160 && overlap.height >= 160
         }
         return usable ? frame : nil
+    }
+
+    /// 既存ウインドウの枠から右へ・下へ少しずらした枠（タブを使わない設定の時の新規作成用）。
+    /// ずらした結果が画面から十分にはみ出す場合は、ずらさず既存の枠をそのまま返す
+    /// （マルチディスプレイを片方だけ外した直後などを想定）。
+    static func cascadedFrame(from base: NSRect, dx: CGFloat = 24, dy: CGFloat = -24) -> NSRect {
+        let offset = base.offsetBy(dx: dx, dy: dy)
+        let usable = NSScreen.screens.contains { screen in
+            let overlap = screen.visibleFrame.intersection(offset)
+            return overlap.width >= 160 && overlap.height >= 160
+        }
+        return usable ? offset : base
     }
 
     @objc private func menuOrderChanged() {
@@ -1339,14 +1431,22 @@ final class Document: NSDocument, NSTextViewDelegate {
         // 以前は3回別々に走査したうえ、manuscriptLinesが全行を配列に確保していた
         var lines = 1
         for u in string.utf16 where u == 10 { lines += 1 }
-        let metrics = CharWidth.measure(string, excludeHeadingMarks: true)
-        let sheets = formatCount((Double(metrics.manuscriptLines) / 20 * 10).rounded(.down) / 10)
-        var status = "\(lines) 行 ｜ \(formatCount(metrics.zenkaku)) 字 ｜ \(sheets) 枚"
+        var status: String
+        if readingHidesCount {
+            // よそから持ってきたMarkdownは原稿ではないので、字数・枚数を出すと分量を
+            // 読み違える（**強調**のような記法も1文字として数えてしまうため）。
+            // 数え方は変えず、間違った数字が出る場面でだけ黙る
+            status = "\(lines) 行 ｜ Markdown表示"
+        } else {
+            let metrics = CharWidth.measure(string, excludeHeadingMarks: true)
+            let sheets = formatCount((Double(metrics.manuscriptLines) / 20 * 10).rounded(.down) / 10)
+            status = "\(lines) 行 ｜ \(formatCount(metrics.zenkaku)) 字 ｜ \(sheets) 枚"
+        }
         // 見出しの印を数から除いていることは、ステータスバーには出さない
         // （除く決まりは使い方に書いてあり、入稿前に「見出しの印をすべて外す」を
         // 通せば、画面の数と渡したファイルの数は完全に一致する）
         let sel = tv.selectedRange()
-        if sel.length > 0 {
+        if sel.length > 0, !readingHidesCount {
             // 全体と選択で数え方が違うと説明がつかないので、選択も同じに数える
             let selected = (string as NSString).substring(with: sel)
             let selMetrics = CharWidth.measure(selected, excludeHeadingMarks: true)
@@ -1535,7 +1635,27 @@ final class Document: NSDocument, NSTextViewDelegate {
         allOffButton.bezelStyle = .rounded
         allOffButton.controlSize = .small
 
+        // --- プリセット：チェックの組み合わせに名前を付けて保存・適用・削除する ---
+        // 呼び出しても即実行はせず、チェックが入れ替わるだけ（そこから手で足し引きしてから「実行」を押せる）
+        let presetPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+        presetPopup.controlSize = .small
+        presetPopup.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
+        presetPopup.target = self
+        presetPopup.action = #selector(assistPresetSelected(_:))
+        let presetSaveButton = NSButton(title: "保存…", target: self, action: #selector(assistPresetSave(_:)))
+        presetSaveButton.bezelStyle = .rounded
+        presetSaveButton.controlSize = .small
+        let presetDeleteButton = NSButton(title: "削除", target: self, action: #selector(assistPresetDelete(_:)))
+        presetDeleteButton.bezelStyle = .rounded
+        presetDeleteButton.controlSize = .small
+        let presetRow = NSStackView(views: [
+            NSTextField(labelWithString: "プリセット"), presetPopup, presetSaveButton, presetDeleteButton,
+        ])
+        presetRow.orientation = .horizontal
+        presetRow.spacing = 6
+
         let stack = NSStackView(views: [
+            presetRow,
             heading("除去する"),
             indented(removeHalf, by: 12),
             indented(removeFull, by: 12),
@@ -1570,8 +1690,9 @@ final class Document: NSDocument, NSTextViewDelegate {
         container.frame = NSRect(x: 0, y: 0, width: assistDialogWidth, height: stack.fittingSize.height)
 
         let checkBoxes = [removeHalf, removeFull, removeTab, removeIndent, digits, units, addIndent, addBlank]
-        Document.assistDialogControls = (checkBoxes, [alphaKeep, alphaFull, alphaHalf])
+        Document.assistDialogControls = (checkBoxes, [alphaKeep, alphaFull, alphaHalf], presetPopup)
         defer { Document.assistDialogControls = nil }
+        refreshAssistPresetPopup(presetPopup)
 
         let alert = NSAlert()
         alert.messageText = "原稿支援"
@@ -1625,9 +1746,9 @@ final class Document: NSDocument, NSTextViewDelegate {
     /// 原稿支援ダイアログの横幅（説明文の折り返し幅もここから決める）
     private var assistDialogWidth: CGFloat { 380 }
 
-    /// 「すべてオフ」から触るためにダイアログ表示中だけ控えておく。
+    /// 「すべてオフ」やプリセットの適用・保存・削除から触るためにダイアログ表示中だけ控えておく。
     /// モーダルなので同時に2つ開くことはない
-    private static var assistDialogControls: (checks: [NSButton], alphabet: [NSButton])?
+    private static var assistDialogControls: (checks: [NSButton], alphabet: [NSButton], presetPopup: NSPopUpButton)?
 
     @objc private func assistAllOff(_ sender: Any?) {
         guard let controls = Document.assistDialogControls else { return }
@@ -1640,6 +1761,91 @@ final class Document: NSDocument, NSTextViewDelegate {
 
     /// ラジオボタンを排他にするためだけのアクション（値は「実行」時にまとめて読む）
     @objc private func assistAlphabetChanged(_ sender: NSButton) {}
+
+    // ---------- 原稿支援のプリセット ----------
+
+    /// チェック8項目の並び順。AssistPreset・presetPopupの項目と対応させるための固定順
+    private static let assistPresetCheckKeys = [
+        "removeHalf", "removeFull", "removeTab", "removeIndent", "digits", "units", "addIndent", "addBlank",
+    ]
+
+    private func refreshAssistPresetPopup(_ popup: NSPopUpButton) {
+        popup.removeAllItems()
+        popup.addItem(withTitle: "プリセット▾")
+        let names = AssistPresetStore.decode(UserDefaults.standard.string(forKey: "assistPresets")).map(\.name)
+        popup.addItems(withTitles: names)
+        popup.selectItem(at: 0)
+    }
+
+    /// 現在のチェック・アルファベットの状態から AssistPreset を組み立てる
+    private static func currentAssistPreset(name: String, controls: (checks: [NSButton], alphabet: [NSButton], presetPopup: NSPopUpButton)) -> AssistPreset {
+        let c = controls.checks
+        let alphabet: String
+        if controls.alphabet[1].state == .on { alphabet = "full" }
+        else if controls.alphabet[2].state == .on { alphabet = "half" }
+        else { alphabet = "keep" }
+        return AssistPreset(
+            name: name,
+            removeHalf: c[0].state == .on, removeFull: c[1].state == .on,
+            removeTab: c[2].state == .on, removeIndent: c[3].state == .on,
+            digits: c[4].state == .on, units: c[5].state == .on,
+            addIndent: c[6].state == .on, addBlank: c[7].state == .on,
+            alphabet: alphabet)
+    }
+
+    /// プリセットをダイアログのチェック・アルファベットへ反映する
+    private static func apply(_ preset: AssistPreset, to controls: (checks: [NSButton], alphabet: [NSButton], presetPopup: NSPopUpButton)) {
+        let values = [
+            preset.removeHalf, preset.removeFull, preset.removeTab, preset.removeIndent,
+            preset.digits, preset.units, preset.addIndent, preset.addBlank,
+        ]
+        for (box, on) in zip(controls.checks, values) { box.state = on ? .on : .off }
+        let index = ["keep": 0, "full": 1, "half": 2][preset.alphabet] ?? 0
+        for (i, radio) in controls.alphabet.enumerated() { radio.state = i == index ? .on : .off }
+    }
+
+    @objc private func assistPresetSelected(_ sender: NSPopUpButton) {
+        guard let controls = Document.assistDialogControls, sender.indexOfSelectedItem > 0 else { return }
+        let name = sender.titleOfSelectedItem ?? ""
+        guard let preset = AssistPresetStore.decode(UserDefaults.standard.string(forKey: "assistPresets"))
+            .first(where: { $0.name == name }) else { return }
+        Document.apply(preset, to: controls)
+    }
+
+    @objc private func assistPresetSave(_ sender: Any?) {
+        guard let controls = Document.assistDialogControls else { return }
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
+        if controls.presetPopup.indexOfSelectedItem > 0 {
+            field.stringValue = controls.presetPopup.titleOfSelectedItem ?? ""
+        }
+        let nameAlert = NSAlert()
+        nameAlert.messageText = "プリセット名"
+        nameAlert.accessoryView = field
+        nameAlert.addButton(withTitle: "保存")
+        nameAlert.addButton(withTitle: "キャンセル")
+        nameAlert.buttons.last?.keyEquivalent = "\u{1b}"
+        nameAlert.window.initialFirstResponder = field
+        // 呼び出し元がすでにモーダル（原稿支援ダイアログ）なので、これもモーダルで重ねる
+        guard nameAlert.runModal() == .alertFirstButtonReturn else { return }
+        let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+
+        let preset = Document.currentAssistPreset(name: name, controls: controls)
+        let presets = AssistPresetStore.upserted(
+            AssistPresetStore.decode(UserDefaults.standard.string(forKey: "assistPresets")), with: preset)
+        UserDefaults.standard.set(AssistPresetStore.encode(presets), forKey: "assistPresets")
+        refreshAssistPresetPopup(controls.presetPopup)
+        controls.presetPopup.selectItem(withTitle: name)
+    }
+
+    @objc private func assistPresetDelete(_ sender: Any?) {
+        guard let controls = Document.assistDialogControls, controls.presetPopup.indexOfSelectedItem > 0 else { return }
+        let name = controls.presetPopup.titleOfSelectedItem ?? ""
+        let presets = AssistPresetStore.removed(
+            AssistPresetStore.decode(UserDefaults.standard.string(forKey: "assistPresets")), name: name)
+        UserDefaults.standard.set(AssistPresetStore.encode(presets), forKey: "assistPresets")
+        refreshAssistPresetPopup(controls.presetPopup)
+    }
 
     /// 推敲。書き上げた原稿の「気になる箇所」を並べる。**直さず、指摘するだけ**。
     /// 原稿支援と違って本文を書き換えないので、ダイアログで選ばせず即座に一覧を出す。
@@ -1871,12 +2077,103 @@ final class Document: NSDocument, NSTextViewDelegate {
     /// 文字を選んでコピーすることはできる。
     func applyReadingMode() {
         guard let tv = textView else { return }
-        tv.isEditable = !readingMode
-        // 読むときは横の文字数目盛りが不要なので隠す（縦の行番号は残す）
-        tv.enclosingScrollView?.hasHorizontalRuler = !readingMode
-        tv.enclosingScrollView?.rulersVisible = true
-        menuBarView?.isDimmedForReading = readingMode
+        preservingScrollTop(tv) {
+            tv.isEditable = !readingMode
+            // 読むときは横の文字数目盛りが不要なので隠す（縦の行番号は残す）。
+            // このルーラーの出し入れでスクロール領域の高さが変わるので、
+            // preservingScrollTop() で必ずMarkdownプレビューの適用・解除ごと包む
+            // （ルーラーだけ戻しても、直後の適用・解除でまたずれるため）
+            tv.enclosingScrollView?.hasHorizontalRuler = !readingMode
+            tv.enclosingScrollView?.rulersVisible = true
+            menuBarView?.isDimmedForReading = readingMode
+            if readingMode {
+                applyMarkdownPreview()
+            } else {
+                clearMarkdownPreview()
+            }
+        }
         updateStatus()
+    }
+
+    // ---------- 閲覧モードのMarkdownプレビュー（β） ----------
+
+    /// 閲覧モード中だけ、Markdownの記法を整形して表示する。**本文は書き換えない**。
+    /// よそのアプリから持ってきた文書を読むための機能で、書くためのものではない
+    /// （Markdown対応とは書かない——中途半端に整えるより、記号のまま読ませたほうがよいと
+    /// 判断した箇所がある。詳しくはMarkdownPreview.swiftを参照）
+    private func applyMarkdownPreview() {
+        readingHidesCount = false
+        guard UserDefaults.standard.bool(forKey: "markdownPreview"),
+              let tv = textView, let storage = tv.textStorage, storage.length > 0 else { return }
+        let chars = Array(tv.string)
+        let marks = MarkdownPreview.marks(chars)
+        let baseFont = tv.font ?? EditorTextView.savedFont()
+        let paragraphStyle = tv.defaultParagraphStyle ?? NSParagraphStyle.default
+        markdownRenderer.apply(to: storage, marks: marks, baseFont: baseFont, paragraphStyle: paragraphStyle)
+        // 「# 」「## 」だけの文書は自分の原稿なので、字数はそのまま出す。
+        // それ以外の記法が混ざっていれば読み物とみなして数字を伏せる
+        readingHidesCount = MarkdownPreview.looksLikeForeignMarkdown(chars, marks)
+        invalidateLineNumberLayout(for: tv)
+    }
+
+    private func clearMarkdownPreview() {
+        readingHidesCount = false
+        guard let tv = textView, let storage = tv.textStorage else { return }
+        let baseFont = tv.font ?? EditorTextView.savedFont()
+        let paragraphStyle = tv.defaultParagraphStyle ?? NSParagraphStyle.default
+        markdownRenderer.clear(storage, baseFont: baseFont, paragraphStyle: paragraphStyle)
+        invalidateLineNumberLayout(for: tv)
+    }
+
+    /// 見出しの拡大・縮小で行の高さが変わり、そこへ横目盛りルーラーの出し入れも重なると、
+    /// NSScrollViewが古いスクロール位置のまま更新しないことがある。文書が縮んだ側では、
+    /// いま画面の上端にある文字が画面外へ押し出されて見える（閲覧モードを抜けると
+    /// 1行ぶん余計にスクロールして見えていた1行目が隠れる不具合の原因だった）。
+    ///
+    /// 自前でスクロール量を計算すると、ルーラーの出し入れ分だけ座標系がずれて
+    /// 何度直しても合わなかった（実際に何パターンも試して失敗した）。
+    /// 代わりに、変更の前後で「画面のいちばん上に見えている文字」を控えておき、
+    /// AppKit自身のスクロール処理（scrollToBeginningOfDocument /
+    /// scrollRangeToVisible）に戻させる。文書の先頭が見えていた場合は
+    /// scrollToBeginningOfDocumentのほうが確実（scrollRangeToVisibleは
+    /// 「見えていればそれ以上動かさない」ため、半端に隠れた状態を直しきれないことがある）。
+    ///
+    /// **戻す処理は次の実行ループへ回す。** 同期的に戻しても、直後にAppKit側が
+    /// （isEditableの切り替えやルーラーの出し入れをきっかけに）スクロール位置を
+    /// 調整し直す処理を挟むことがあり、そちらが後から効いて元に戻ってしまっていた
+    /// （Android版のeditor.post{}と同じ理由）。
+    private func preservingScrollTop(_ tv: NSTextView, _ body: () -> Void) {
+        guard let layoutManager = tv.layoutManager, let container = tv.textContainer,
+              let storage = tv.textStorage, storage.length > 0 else {
+            body()
+            return
+        }
+        let visibleRect = tv.visibleRect
+        let topGlyph = layoutManager.glyphRange(forBoundingRect: visibleRect, in: container).location
+        let topChar = layoutManager.numberOfGlyphs > 0
+            ? layoutManager.characterIndexForGlyph(at: min(topGlyph, layoutManager.numberOfGlyphs - 1))
+            : 0
+
+        body()
+
+        DispatchQueue.main.async { [weak tv] in
+            guard let tv, let storage = tv.textStorage, storage.length > 0 else { return }
+            tv.window?.layoutIfNeeded()
+            if topChar <= 0 {
+                tv.scrollToBeginningOfDocument(nil)
+            } else {
+                tv.scrollRangeToVisible(NSRange(location: min(topChar, storage.length - 1), length: 0))
+            }
+        }
+    }
+
+    /// 行番号ガターは「直前の控えから数える」ための独自の控えを持っており、
+    /// 通常の編集（NSText.didChangeNotification）でしか捨てられない。
+    /// Markdownプレビューの適用・解除は本文の文字を変えないのでその通知が飛ばず、
+    /// 見出しなどの行の高さだけが変わって控えとレイアウトの食い違いが起きる
+    /// （閲覧モードを抜けると行番号や本文の表示が崩れる不具合の原因だった）
+    private func invalidateLineNumberLayout(for tv: NSTextView) {
+        (tv.enclosingScrollView?.verticalRulerView as? LineNumberRulerView)?.invalidateAllLayout()
     }
 
     private func menuItemDefs() -> [MenuButtonDef] {
@@ -1940,6 +2237,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             "darkMode": "system", // "system"/"light"/"dark"
             "printFontSize": 0.0, // 印刷時の文字サイズ。0で画面表示と同じサイズを使う
             "tabsEnabled": true, // ウインドウをタブでまとめるか
+            "markdownPreview": true, // 閲覧モードをMarkdown表示するか（β）
         ])
         applyDarkModeSetting()
         NSApp.mainMenu = buildMainMenu()
@@ -2112,6 +2410,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             let tabsRow = NSStackView(views: [tabsCheck])
             tabsRow.orientation = .horizontal
 
+            // --- 閲覧モードのMarkdown表示 ---
+            let markdownCheck = NSButton(checkboxWithTitle: "閲覧モードをMarkdown表示（β）",
+                                         target: self, action: #selector(toggleMarkdownPreview(_:)))
+            markdownCheck.state = UserDefaults.standard.bool(forKey: "markdownPreview") ? .on : .off
+            let markdownRow = NSStackView(views: [markdownCheck])
+            markdownRow.orientation = .horizontal
+
             // --- ダークモード ---
             let darkModeTitle = NSTextField(labelWithString: "ダークモード:")
             let currentDarkMode = UserDefaults.standard.string(forKey: "darkMode") ?? "system"
@@ -2210,7 +2515,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
             let stack = NSStackView(views: [
                 folderRow, fontSizeRow, listFontRow, wrapRow, noParagraphRow,
-                tabsRow,
+                tabsRow, markdownRow,
                 darkModeTitle, darkModeRow,
                 printFontRow, autoSaveRow, dateRow, timeRow, menuEditRow,
             ])
@@ -2257,6 +2562,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     /// 変化は設定ウインドウを閉じた瞬間（windowWillClose）にまとめて行う
     @objc private func toggleTabsEnabled(_ sender: NSButton) {
         UserDefaults.standard.set(sender.state == .on, forKey: "tabsEnabled")
+    }
+
+    /// 閲覧モード中のウインドウがあれば、その場でMarkdown表示の有無を反映する
+    @objc private func toggleMarkdownPreview(_ sender: NSButton) {
+        UserDefaults.standard.set(sender.state == .on, forKey: "markdownPreview")
+        for case let document as Document in NSDocumentController.shared.documents {
+            document.applyReadingMode()
+        }
     }
 
     func windowWillClose(_ notification: Notification) {

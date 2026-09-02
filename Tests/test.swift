@@ -9,6 +9,20 @@ func check(_ name: String, _ actual: String, _ expected: String) {
         print("NG  \(name)\n  expected: \(expected.debugDescription)\n  actual:   \(actual.debugDescription)")
     }
 }
+func checkB(_ name: String, _ actual: Bool, _ expected: Bool) {
+    if actual == expected {
+        print("OK  \(name)")
+    } else {
+        failures += 1
+        print("NG  \(name)  expected \(expected), got \(actual)")
+    }
+}
+func checkArr(_ name: String, _ actual: [String], _ expected: [String]) {
+    check(name, actual.joined(separator: "｜"), expected.joined(separator: "｜"))
+}
+func checkArrI(_ name: String, _ actual: [Int], _ expected: [Int]) {
+    check(name, actual.map(String.init).joined(separator: "｜"), expected.map(String.init).joined(separator: "｜"))
+}
 func checkD(_ name: String, _ actual: Double, _ expected: Double) {
     if abs(actual - expected) < 0.0001 {
         print("OK  \(name)")
@@ -387,6 +401,10 @@ checkI("推敲_複合名詞の物は数えない",
        proof("大切な食べ物であり、海の生き物が減る。買い物に行く。読んだものを並べる。", .variant).count, 0)
 checkI("推敲_連体形に続く物とものは拾う",
        proof("読んだ物を並べる。読んだものを数える。読んだものを片づける。", .variant).count, 1)
+checkI("推敲_変更にの更を更にと混同しない",
+       proof("運用変更に合わせて組み換える。", .variant).count, 0)
+checkI("推敲_変更にがあっても更にとさらにの表記ゆれは拾う",
+       proof("運用変更に合わせて、さらに更に手を加える。", .variant).count, 1)
 
 // 会話文は句点なしで「」を閉じるので、そこで文が切れないと次の段落とつながる
 checkI("推敲_閉じ括弧で終わる行は文が切れる",
@@ -707,6 +725,56 @@ check("ファイル名_印だけの行は飛ばす",
 check("ファイル名_印でないシャープは全角にする",
       FileNaming.fileName(fromFirstLineOf: "#1 の札"), "＃1 の札")
 
+// ---- 拡張子の解釈（ファイル名変更） ----
+// 既知の拡張子（txt/md）ならそれを切り出し、知らない拡張子は題名の一部として扱う
+check("拡張子_既知のmdは切り出す",
+      FileNaming.withExtension(typed: "メモ.md", fallback: "txt").base, "メモ")
+check("拡張子_既知のmdは切り出す_拡張子側",
+      FileNaming.withExtension(typed: "メモ.md", fallback: "txt").ext, "md")
+check("拡張子_大文字も既知として扱う",
+      FileNaming.withExtension(typed: "メモ.MD", fallback: "txt").ext, "md")
+check("拡張子_知らない拡張子は題名の一部",
+      FileNaming.withExtension(typed: "第3章.決意", fallback: "txt").base, "第3章.決意")
+check("拡張子_知らない拡張子はfallbackを補う",
+      FileNaming.withExtension(typed: "第3章.決意", fallback: "txt").ext, "txt")
+check("拡張子_拡張子なしはfallbackを補う",
+      FileNaming.withExtension(typed: "メモ", fallback: "txt").ext, "txt")
+check("拡張子_先頭ドットのみは拡張子扱いしない",
+      FileNaming.withExtension(typed: ".envrc", fallback: "txt").base, ".envrc")
+
+// ---- 原稿支援のプリセット ----
+let samplePreset = AssistPreset(
+    name: "出し先A", removeHalf: true, removeFull: false, removeTab: true, removeIndent: false,
+    digits: true, units: false, addIndent: true, addBlank: false, alphabet: "full")
+let decodedPresets = AssistPresetStore.decode(AssistPresetStore.encode([samplePreset]))
+check("プリセット_エンコードデコードで名前が保たれる",
+      decodedPresets.first?.name ?? "", "出し先A")
+check("プリセット_エンコードデコードでアルファベット設定が保たれる",
+      decodedPresets.first?.alphabet ?? "", "full")
+checkI("プリセット_チェック項目が保たれる（半角除去オン）",
+       (decodedPresets.first?.removeHalf ?? false) ? 1 : 0, 1)
+checkI("プリセット_チェック項目が保たれる（全角除去オフ）",
+       (decodedPresets.first?.removeFull ?? true) ? 1 : 0, 0)
+check("プリセット_不正なJSONは空配列",
+      AssistPresetStore.decode("not json").isEmpty ? "空" : "空でない", "空")
+check("プリセット_未保存キーは空配列",
+      AssistPresetStore.decode(nil).isEmpty ? "空" : "空でない", "空")
+
+let upsertedNew = AssistPresetStore.upserted([samplePreset], with: AssistPreset(
+    name: "出し先B", removeHalf: false, removeFull: false, removeTab: false, removeIndent: false,
+    digits: false, units: false, addIndent: false, addBlank: false, alphabet: "keep"))
+checkI("プリセット_同名が無ければ追加", upsertedNew.count, 2)
+
+let upsertedOverwrite = AssistPresetStore.upserted([samplePreset], with: AssistPreset(
+    name: "出し先A", removeHalf: false, removeFull: false, removeTab: false, removeIndent: false,
+    digits: false, units: false, addIndent: false, addBlank: false, alphabet: "keep"))
+checkI("プリセット_同名があれば上書き（件数は変わらない）", upsertedOverwrite.count, 1)
+checkI("プリセット_同名があれば上書き（半角除去はオフになる）",
+       (upsertedOverwrite.first?.removeHalf ?? true) ? 1 : 0, 0)
+
+let removedPresets = AssistPresetStore.removed([samplePreset], name: "出し先A")
+checkI("プリセット_削除で件数が減る", removedPresets.count, 0)
+
 // ---- 節の並べ替え ----
 let reorderDoc = "まえがき。\n# 一章\n\u{3000}本文一。\n\n# 二章\n\u{3000}本文二。\n\n# 三章\n\u{3000}本文三。\n"
 
@@ -788,6 +856,106 @@ checkI("確定_すでに印のある行は飛ばす",
        Outline.applyMarks("# 見出し\n\u{3000}本文です。", lineStarts: [0]) == nil ? 1 : 0, 1)
 checkI("確定_一つも選ばなければ何もしない",
        Outline.applyMarks("見出し\n", lineStarts: []) == nil ? 1 : 0, 1)
+
+// ---- 閲覧モードのMarkdownプレビュー（β）----
+// Android版のMarkdownPreviewTest.ktと同じ観点の移植
+
+func mdMarks(_ text: String) -> [MarkdownPreview.Mark] { MarkdownPreview.marks(Array(text)) }
+func mdTexts(_ src: String, _ kind: MarkdownPreview.Kind) -> [String] {
+    let chars = Array(src)
+    return mdMarks(src).filter { $0.kind == kind }.map { String(chars[$0.start..<$0.end]) }
+}
+func mdHidden(_ src: String) -> [String] { mdTexts(src, .hidden) }
+func mdLevels(_ src: String, _ kind: MarkdownPreview.Kind) -> [Int] {
+    mdMarks(src).filter { $0.kind == kind }.map { $0.level }
+}
+func mdForeign(_ src: String) -> Bool { MarkdownPreview.looksLikeForeignMarkdown(Array(src), mdMarks(src)) }
+
+// -- 見出し（印の側と違い6段まで受け入れる）
+checkArr("MD_大見出しを拾う", mdTexts("# はじめに", .heading), ["はじめに"])
+checkArrI("MD_三段以上の見出しも拾う", mdLevels("### 小さな見出し", .heading), [3])
+checkArrI("MD_六段まで拾う", mdLevels("###### 最小", .heading), [6])
+checkArr("MD_七段は見出しにしない", mdTexts("####### 行き過ぎ", .heading), [])
+checkArr("MD_井桁のあとに空白がなければ見出しにしない", mdTexts("#見出しではない", .heading), [])
+checkArr("MD_全角の井桁は見出しにしない", mdTexts("＃ 本文です", .heading), [])
+checkArr("MD_見出しの記号は画面から消える", mdHidden("## 小見出し"), ["## "])
+
+// -- 強調
+checkArr("MD_太字を拾う", mdTexts("これは**強調**です", .bold), ["強調"])
+checkArr("MD_斜体を拾う", mdTexts("これは*斜め*です", .italic), ["斜め"])
+checkArr("MD_太字斜体を拾う", mdTexts("***両方***", .boldItalic), ["両方"])
+checkArr("MD_打ち消しを拾う", mdTexts("~~消し~~", .strike), ["消し"])
+checkArr("MD_強調の記号は画面から消える", mdHidden("**強調**"), ["**", "**"])
+checkArr("MD_閉じない星印は記法として扱わない", mdTexts("5*3の答え", .italic), [])
+checkArr("MD_閉じない星印は何も消さない", mdHidden("5*3の答え"), [])
+checkArr("MD_中身が空の強調は記法として扱わない", mdTexts("****", .bold), [])
+checkArr("MD_英単語の途中の下線は強調にしない", mdTexts("save_folder_name を見る", .italic), [])
+checkArr("MD_単語の外の下線は強調にする", mdTexts("これは_強調_です", .italic), ["強調"])
+
+// -- コード
+checkArr("MD_行中のコードを拾う", mdTexts("`val x = 1` と書く", .code), ["val x = 1"])
+checkArr("MD_囲みの中の行をコードとして拾う",
+         mdTexts("```kotlin\nval x = 1\nprintln(x)\n```", .codeBlock), ["val x = 1", "println(x)"])
+checkB("MD_囲みの行そのものは画面から消える",
+       Set(mdHidden("```\nコード\n```")).isSuperset(of: ["```", "```"]), true)
+checkArr("MD_囲みの中の星印は強調にしない", mdTexts("```\n**これは文字**\n```", .bold), [])
+checkArr("MD_囲みの中の井桁は見出しにしない", mdTexts("```\n# 文字\n```", .heading), [])
+
+// -- 箇条書き・引用
+checkArr("MD_箇条書きを拾う", mdTexts("- 朝に出た", .bullet), ["- 朝に出た"])
+checkArr("MD_箇条書きの記号は画面から消える", mdHidden("- 朝に出た"), ["- "])
+checkArr("MD_記号のあとに空白がなければ箇条書きにしない", mdTexts("-朝に出た", .bullet), [])
+checkArr("MD_番号つき箇条書きは番号を消さない", mdHidden("1. 朝に出た"), [])
+checkArr("MD_番号つき箇条書きを拾う", mdTexts("1. 朝に出た", .ordered), ["1. 朝に出た"])
+checkArrI("MD_引用を拾う", mdLevels("> 引用文", .quote), [1])
+checkArrI("MD_入れ子の引用の深さを数える", mdLevels(">> 深い引用", .quote), [2])
+checkArr("MD_引用の中の見出しを拾う", mdTexts("> # 題", .heading), ["題"])
+
+// -- 水平線・表・リンク
+checkArr("MD_水平線を拾う", mdTexts("---", .rule), ["---"])
+checkArr("MD_短い連続は水平線にしない", mdTexts("--", .rule), [])
+checkArr("MD_全角ダッシュは水平線にしない", mdTexts("――――", .rule), [])
+checkI("MD_表の行には何もしない", mdMarks("| 駅 | 時刻 |").count, 0)
+checkArr("MD_表の区切り行も消さない", mdHidden("|---|---|"), [])
+checkArr("MD_表の中の強調は効く", mdTexts("| **三芳** | 14:00 |", .bold), ["三芳"])
+checkArr("MD_リンクは文字だけを残す", mdTexts("[ここ](https://example.com)", .link), ["ここ"])
+
+// -- 画像（絵は出せないので説明文だけ残す）
+checkArr("MD_画像は記法をすべて消す",
+         mdHidden("![写真](https://example.com/a.png)"), ["![", "](https://example.com/a.png)"])
+checkArr("MD_画像はリンクとして扱わない", mdTexts("![写真](https://example.com/a.png)", .link), [])
+checkI("MD_閉じない画像記法は文字のまま", mdMarks("びっくり! すごい").count, 0)
+checkArr("MD_リンクのURLは画面から消える",
+         mdHidden("[ここ](https://example.com)"), ["[", "](https://example.com)"])
+
+// -- 原稿を壊さないこと（普通の日本語の文章に何も起きない）
+checkI("MD_普通の日本語の段落には何も起きない", mdMarks("　姫新線は兵庫県の路線です。").count, 0)
+checkI("MD_会話文には何も起きない", mdMarks("「最初の1年は苦しかったです」").count, 0)
+checkI("MD_中黒の箇条書きには何も起きない", mdMarks("・新橋に着いた\n・横浜に着いた").count, 0)
+checkI("MD_空の本文でも落ちない", mdMarks("").count, 0)
+checkI("MD_改行だけでも落ちない", mdMarks("\n\n\n").count, 0)
+
+// -- 「よそのMarkdownか」の判定（字数を隠すかどうかを決める）
+checkB("MD_普通の原稿はよそのMarkdownではない",
+       mdForeign("　姫新線は兵庫県の路線です。\n\n　次の日も乗った。"), false)
+checkB("MD_見出しの印だけならよそのMarkdownではない",
+       mdForeign("# 第一章\n\n　姫新線に乗った。\n\n## 出発\n\n　朝だった。"), false)
+checkB("MD_三段の見出しがあればよそのMarkdown", mdForeign("### 小見出し"), true)
+checkB("MD_強調があればよそのMarkdown", mdForeign("これは**強調**です"), true)
+checkB("MD_箇条書きがあればよそのMarkdown", mdForeign("- 朝に出た"), true)
+checkB("MD_引用があればよそのMarkdown", mdForeign("> 引用文"), true)
+checkB("MD_表があればよそのMarkdown", mdForeign("| 駅 | 時刻 |"), true)
+checkB("MD_印だけの見出しと表でもよそのMarkdown", mdForeign("## 行程\n\n| 駅 | 時刻 |"), true)
+checkB("MD_縦棒が1本だけなら表とみなさない", mdForeign("これは a | b という書き方です。"), false)
+checkB("MD_コードの囲みがあればよそのMarkdown", mdForeign("```\nval x = 1\n```"), true)
+checkB("MD_リンクがあればよそのMarkdown", mdForeign("[ここ](https://example.com)"), true)
+checkB("MD_閉じない星印ではよそのMarkdownにしない", mdForeign("5*3の答えを書く。"), false)
+checkB("MD_中黒の箇条書きではよそのMarkdownにしない", mdForeign("・新橋に着いた\n・横浜に着いた"), false)
+
+// -- 見出しの印との独立（ここが崩れると目次・並べ替えが壊れる）
+checkI("MD_三段の見出しは印としては本文のまま", CharWidth.headingMarkLength(Array("### 小さな見出し"), 0), 0)
+checkI("MD_印の側は今までどおり二段まで_1", CharWidth.headingMarkLength(Array("# 大見出し"), 0), 2)
+checkI("MD_印の側は今までどおり二段まで_2", CharWidth.headingMarkLength(Array("## 小見出し"), 0), 3)
 
 if failures == 0 {
     print("\nすべてのテストに合格")
