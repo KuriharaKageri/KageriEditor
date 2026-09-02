@@ -70,8 +70,19 @@ final class MarkdownPreviewRenderer {
         case .hidden:
             // 極端に小さいフォントサイズ（実質ゼロ幅）でTextKitのレイアウトを
             // 壊すことがあった（閲覧モードを抜けると本文が丸ごと表示されなくなる
-            // 不具合の原因だった）。文字の幅は残るが、確実な方法として色だけ消す
+            // 不具合の原因だった）ため、色だけを消して幅は残す方式にしている。
+            // ただしそのままだと、見出しの前などに透明な余白が残って字下げのように
+            // 見えてしまう。範囲の最後の文字にだけ、その範囲ぶんの負のカーニングを
+            // かけて後続の文字を詰め、見た目の幅をほぼゼロに潰す
+            // （フォントサイズには触れないので、極小フォントの不具合は再発しない）
             storage.addAttribute(.foregroundColor, value: NSColor.clear, range: range)
+            let hiddenText = (storage.string as NSString).substring(with: range)
+            let font = storage.attribute(.font, at: range.location, effectiveRange: nil) as? NSFont ?? baseFont
+            let width = (hiddenText as NSString).size(withAttributes: [.font: font]).width
+            if width > 0 {
+                let lastChar = NSRange(location: range.location + range.length - 1, length: 1)
+                storage.addAttribute(.kern, value: -width, range: lastChar)
+            }
 
         case .rule:
             // Androidは行の中ほどへ横線を描くが、本文を1文字も変えない作りのままMacで
