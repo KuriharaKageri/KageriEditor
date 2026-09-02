@@ -72,16 +72,17 @@ final class MarkdownPreviewRenderer {
             // 壊すことがあった（閲覧モードを抜けると本文が丸ごと表示されなくなる
             // 不具合の原因だった）ため、色だけを消して幅は残す方式にしている。
             // ただしそのままだと、見出しの前などに透明な余白が残って字下げのように
-            // 見えてしまう。範囲の最後の文字にだけ、その範囲ぶんの負のカーニングを
-            // かけて後続の文字を詰め、見た目の幅をほぼゼロに潰す
-            // （フォントサイズには触れないので、極小フォントの不具合は再発しない）
+            // 見えてしまう。1文字ずつ「自分の幅ぶんの負のカーニング」を載せて、
+            // 1文字ごとに自分の場所を詰める（範囲の最後の1文字だけにまとめて
+            // 負のカーニングを載せる方式は、`##`のように隠す文字が複数（特に
+            // 見出しの井桁が2つ以上）のときに詰めきれずに残ることがあった）
             storage.addAttribute(.foregroundColor, value: NSColor.clear, range: range)
-            let hiddenText = (storage.string as NSString).substring(with: range)
             let font = storage.attribute(.font, at: range.location, effectiveRange: nil) as? NSFont ?? baseFont
-            let width = (hiddenText as NSString).size(withAttributes: [.font: font]).width
-            if width > 0 {
-                let lastChar = NSRange(location: range.location + range.length - 1, length: 1)
-                storage.addAttribute(.kern, value: -width, range: lastChar)
+            let hiddenText = (storage.string as NSString).substring(with: range)
+            for (offset, ch) in hiddenText.enumerated() {
+                let charWidth = String(ch).size(withAttributes: [.font: font]).width
+                guard charWidth > 0 else { continue }
+                storage.addAttribute(.kern, value: -charWidth, range: NSRange(location: range.location + offset, length: 1))
             }
 
         case .rule:
