@@ -19,13 +19,14 @@ open "build/KageriEditor.app"
 
 ## テストの実行
 
-`Tests/test.swift` は `TextLogic.swift` の純粋ロジック（文字数カウント・整形・非整形・
-空行除去・原稿用紙換算・ファイル名生成）を検証します。
+`Tests/test.swift` は純粋ロジック（文字数カウント・整形・非整形・空行除去・
+原稿用紙換算・ファイル名生成・変換の対象範囲・推敲・見出し・Markdown表示）を検証します。
+コンパイルする組み合わせは `make_dist.sh` と同じです。
 
 ```sh
 TEST_DIR=$(mktemp -d)
 cp Tests/test.swift "$TEST_DIR/main.swift"   # エントリポイントは main.swift という名前である必要がある
-swiftc -o "$TEST_DIR/run_tests" Sources/TextLogic.swift "$TEST_DIR/main.swift"
+swiftc -o "$TEST_DIR/run_tests" Sources/TextLogic.swift Sources/ProofCheck.swift Sources/Outline.swift Sources/MarkdownPreview.swift "$TEST_DIR/main.swift"
 "$TEST_DIR/run_tests"
 ```
 

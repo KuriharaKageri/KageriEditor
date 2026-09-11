@@ -1523,33 +1523,21 @@ final class Document: NSDocument, NSTextViewDelegate {
 
     // ---------- 変換コマンド ----------
 
-    /// 選択範囲（なければ文書全体）にテキスト変換を適用する。
+    /// 選択範囲にテキスト変換を適用する。
     /// 選択が行の途中から始まっていても・途中で終わっていても、その行全体を
     /// 選択しているものとみなして行単位で処理する（整形・非整形・空行除去・原稿支援で共通）。
-    private func applyTransform(_ transform: (String) -> String) {
+    /// 選択が無いときに何を対象にするかは noSelectionScope で決める。
+    private func applyTransform(_ transform: (String) -> String,
+                                noSelectionScope: TextTransform.NoSelectionScope = .wholeDocument,
+                                recognizeParagraphs: Bool = true) {
         guard let tv = textView else { return }
         let full = tv.string as NSString
         let selection = tv.selectedRange()
         let hasSelection = selection.length > 0
-        var range = selection
-        if !hasSelection {
-            range = NSRange(location: 0, length: full.length)
-        } else {
-            // 行の途中から始まる選択は行頭まで広げる
-            let lineStart = full.lineRange(for: NSRange(location: range.location, length: 0)).location
-            if lineStart < range.location {
-                range.length += range.location - lineStart
-                range.location = lineStart
-            }
-            // 行の途中で終わる選択は行末まで広げる
-            let end = NSMaxRange(range)
-            if end < full.length, end > 0, full.character(at: end - 1) != 0x0A {
-                let lineRange = full.lineRange(for: NSRange(location: end, length: 0))
-                var lineEnd = NSMaxRange(lineRange)
-                if lineEnd > 0 && full.character(at: lineEnd - 1) == 0x0A { lineEnd -= 1 }
-                if lineEnd > end { range.length = lineEnd - range.location }
-            }
-        }
+        let range = TextTransform.targetRange(in: full,
+                                              selection: selection,
+                                              noSelectionScope: noSelectionScope,
+                                              recognizeParagraphs: recognizeParagraphs)
         guard range.length > 0 else { return }
         let target = full.substring(with: range)
         let replaced = transform(target)
@@ -1558,14 +1546,27 @@ final class Document: NSDocument, NSTextViewDelegate {
         // 変換後は選択を解除する。カーソルは、選択して実行したときは対象の先頭へ、
         // 文書全体に実行したときは元の位置へ寄せて、画面が大きく飛ばないようにする
         let newLength = (tv.string as NSString).length
-        let caret = hasSelection ? range.location : selection.location
+        var caret = hasSelection ? range.location : selection.location
+        if !hasSelection, noSelectionScope != .wholeDocument {
+            // 行や段落の中でのカーソルの位置を保つ。整形は改行を足すだけ、非整形は
+            // 改行を取るだけなので、前後を突き合わせれば同じ文字のところへ戻せる
+            caret = range.location
+                + TextTransform.mappedCaret(from: target as NSString,
+                                            to: replaced as NSString,
+                                            offset: selection.location - range.location)
+        }
         tv.setSelectedRange(NSRange(location: min(caret, newLength), length: 0))
     }
 
-    /// 改行だけを取り除く（スペースの除去は「原稿支援」のダイアログが担当する）
+    /// 改行だけを取り除く（スペースの除去は「原稿支援」のダイアログが担当する）。
+    /// 選択が無いときは、文書全体ではなくカーソルのある段落だけを対象にする。
+    /// 段落の切れ目は非整形自身の判定と同じものを使うので、設定「非整形で段落を
+    /// 区別しない」を入れていると、切れ目は空行と見出しだけになる
     @objc func removeNewlinesCommand(_ sender: Any?) {
         let noParagraphDetect = UserDefaults.standard.bool(forKey: "noParagraphDetect")
-        applyTransform { TextTransform.removeNewlines($0, recognizeParagraphs: !noParagraphDetect) }
+        applyTransform({ TextTransform.removeNewlines($0, recognizeParagraphs: !noParagraphDetect) },
+                       noSelectionScope: .currentParagraph,
+                       recognizeParagraphs: !noParagraphDetect)
     }
 
     /// 原稿支援。書き上げたあとの体裁を整える処理をダイアログでまとめて選び、1回で適用する。
@@ -1923,8 +1924,10 @@ final class Document: NSDocument, NSTextViewDelegate {
     @objc func wrapCommand(_ sender: Any?) {
         var count = UserDefaults.standard.integer(forKey: "wrapWidth")
         if count <= 0 { count = 40 }
-        // 行の途中から／途中まで選択した場合も、applyTransformがその行全体へ広げる
-        applyTransform { TextTransform.wrap($0, limit: Double(count)) }
+        // 行の途中から／途中まで選択した場合も、applyTransformがその行全体へ広げる。
+        // 選択が無いときは、文書全体ではなくカーソルのある論理行だけを整形する
+        applyTransform({ TextTransform.wrap($0, limit: Double(count)) },
+                       noSelectionScope: .currentLine)
     }
 
     // ---------- 日付・時刻の挿入 ----------

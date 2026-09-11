@@ -957,6 +957,120 @@ checkI("MD_三段の見出しは印としては本文のまま", CharWidth.headi
 checkI("MD_印の側は今までどおり二段まで_1", CharWidth.headingMarkLength(Array("# 大見出し"), 0), 2)
 checkI("MD_印の側は今までどおり二段まで_2", CharWidth.headingMarkLength(Array("## 小見出し"), 0), 3)
 
+// ============================================================
+// 変換コマンドが対象にする範囲（2.32：整形は未選択ならカーソル行だけ）
+// ============================================================
+
+/// 対象範囲を「実際に切り出される文字列」に直して見比べる
+func scoped(_ text: String, _ loc: Int, _ len: Int,
+            _ scope: TextTransform.NoSelectionScope) -> String {
+    let ns = text as NSString
+    let r = TextTransform.targetRange(in: ns,
+                                      selection: NSRange(location: loc, length: len),
+                                      noSelectionScope: scope)
+    return ns.substring(with: r)
+}
+
+let 三行 = "一行目です\n二行目です\n三行目です"
+
+// -- 未選択のとき
+check("範囲_未選択の整形はカーソルのある行だけ", scoped(三行, 8, 0, .currentLine), "二行目です")
+check("範囲_未選択の整形は行頭でもその行", scoped(三行, 6, 0, .currentLine), "二行目です")
+check("範囲_未選択の整形は行末でもその行", scoped(三行, 11, 0, .currentLine), "二行目です")
+check("範囲_未選択の整形は改行の直後なら次の行", scoped(三行, 12, 0, .currentLine), "三行目です")
+check("範囲_未選択の整形は最終行では改行なし", scoped(三行, 14, 0, .currentLine), "三行目です")
+check("範囲_未選択の非整形は文書全体", scoped(三行, 8, 0, .wholeDocument), 三行)
+check("範囲_末尾の空行では対象なし", scoped("一行目です\n", 6, 0, .currentLine), "")
+check("範囲_空の文書では対象なし", scoped("", 0, 0, .currentLine), "")
+
+// -- 選択があるとき（どちらのscopeでも同じ＝含まれる論理行すべて）
+check("範囲_行の途中からの選択は行頭まで広がる", scoped(三行, 8, 2, .currentLine), "二行目です")
+check("範囲_行をまたぐ選択はその論理行すべて", scoped(三行, 3, 8, .currentLine), "一行目です\n二行目です")
+check("範囲_選択があれば非整形も同じ範囲", scoped(三行, 3, 8, .wholeDocument), "一行目です\n二行目です")
+check("範囲_行頭から改行までの選択はそのまま", scoped(三行, 6, 6, .currentLine), "二行目です\n")
+check("範囲_最終行の途中までの選択は行末まで広がる", scoped(三行, 13, 2, .currentLine), "三行目です")
+
+// -- 整形と組み合わせたときに、他の行へ手が及ばないこと
+let 長い行 = "あああああ\nいいいいいいいいいい\nううううう"
+check("範囲_整形はカーソル行だけを折り返す",
+      { let ns = 長い行 as NSString
+        let r = TextTransform.targetRange(in: ns,
+                                          selection: NSRange(location: 8, length: 0),
+                                          noSelectionScope: .currentLine)
+        return ns.replacingCharacters(in: r,
+                                      with: TextTransform.wrap(ns.substring(with: r), limit: 5)) }(),
+      "あああああ\nいいいいい\nいいいいい\nううううう")
+
+// ============================================================
+// 非整形が対象にする段落（2.33：未選択ならカーソルのある段落だけ）
+// ============================================================
+
+func scopedP(_ text: String, _ loc: Int, _ len: Int, _ recognize: Bool = true) -> String {
+    let ns = text as NSString
+    let r = TextTransform.targetRange(in: ns,
+                                      selection: NSRange(location: loc, length: len),
+                                      noSelectionScope: .currentParagraph,
+                                      recognizeParagraphs: recognize)
+    return ns.substring(with: r)
+}
+
+// 一字下げで分かれた2段落。細切れの改行は切れ目にならない
+let 二段落 = "　春はあけぼの。\nやうやう白くなりゆく。\n　夏は夜。\n月のころはさらなり。"
+check("段落_ふつうの改行では切れない", scopedP(二段落, 12, 0), "　春はあけぼの。\nやうやう白くなりゆく。")
+check("段落_次の一字下げから先は別の段落", scopedP(二段落, 24, 0), "　夏は夜。\n月のころはさらなり。")
+check("段落_段落の先頭の行でも同じ範囲", scopedP(二段落, 0, 0), "　春はあけぼの。\nやうやう白くなりゆく。")
+
+// 空行で分かれた2段落（一字下げなし）
+let 空行区切り = "春はあけぼの。\nやうやう白く。\n\n夏は夜。\n月のころ。"
+check("段落_空行で切れる", scopedP(空行区切り, 3, 0), "春はあけぼの。\nやうやう白く。")
+check("段落_空行の次は別の段落", scopedP(空行区切り, 17, 0), "夏は夜。\n月のころ。")
+check("段落_空行の上では対象なし", scopedP(空行区切り, 16, 0), "")
+
+// 段落の印いろいろ
+check("段落_箇条書きの行はそこで切れる",
+      scopedP("本文です。\n続きです。\n・ひとつめ\n・ふたつめ", 3, 0), "本文です。\n続きです。")
+check("段落_かぎ括弧の会話文はそこで切れる",
+      scopedP("地の文です。\n「こんにちは」\n「さようなら」", 20, 0), "「さようなら」")
+check("段落_見出しの前後は切れる",
+      scopedP("# 見出し\n本文です。\n続きです。", 8, 0), "本文です。\n続きです。")
+check("段落_見出しの行そのものは1行だけ", scopedP("# 見出し\n本文です。", 2, 0), "# 見出し")
+
+// 設定「非整形で段落を区別しない」を入れると、記号では切れず空行だけで切れる
+check("段落_区別しない設定では一字下げで切れない",
+      scopedP(二段落, 12, 0, false), 二段落)
+check("段落_区別しない設定でも空行では切れる",
+      scopedP(空行区切り, 3, 0, false), "春はあけぼの。\nやうやう白く。")
+
+// 選択があれば段落ではなく選んだ論理行すべて（scopeによらず同じ）
+check("段落_選択があれば選んだ行だけ", scopedP(二段落, 0, 3), "　春はあけぼの。")
+
+// 非整形と組み合わせて、隣の段落に手が及ばないこと
+check("段落_非整形はカーソルの段落だけをつなぐ",
+      { let ns = 二段落 as NSString
+        let r = TextTransform.targetRange(in: ns,
+                                          selection: NSRange(location: 12, length: 0),
+                                          noSelectionScope: .currentParagraph)
+        return ns.replacingCharacters(in: r,
+                                      with: TextTransform.removeNewlines(ns.substring(with: r))) }(),
+      "　春はあけぼの。やうやう白くなりゆく。\n　夏は夜。\n月のころはさらなり。")
+
+// -- カーソルの位置合わせ
+func caretAfter(_ text: String, _ offset: Int, _ transform: (String) -> String) -> Int {
+    TextTransform.mappedCaret(from: text as NSString,
+                              to: transform(text) as NSString,
+                              offset: offset)
+}
+checkI("カーソル_整形で足した改行のぶん後ろへ",
+       caretAfter("あいうえおかきくけこ", 7) { TextTransform.wrap($0, limit: 5) }, 8)
+checkI("カーソル_非整形で取った改行のぶん手前へ",
+       caretAfter("あいう\nかきく", 4) { TextTransform.removeNewlines($0) }, 3)
+checkI("カーソル_変わらない位置はそのまま",
+       caretAfter("あいう\nかきく", 2) { TextTransform.removeNewlines($0) }, 2)
+checkI("カーソル_先頭は動かない",
+       caretAfter("あいうえおかきくけこ", 0) { TextTransform.wrap($0, limit: 5) }, 0)
+checkI("カーソル_末尾は変換後の末尾へ",
+       caretAfter("あいうえおかきくけこ", 10) { TextTransform.wrap($0, limit: 5) }, 11)
+
 if failures == 0 {
     print("\nすべてのテストに合格")
 } else {

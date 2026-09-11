@@ -257,28 +257,30 @@ enum TextTransform {
         var out = ""
         for i in lines.indices {
             let line = lines[i]
-            if i > 0 {
-                // 空白だけの行も空行として扱う。書き手には空行に見えるので、
-                // 次の行に吸収されると「勝手に詰められた」ことになる
-                let prevEmpty = lines[i - 1].trimmingCharacters(in: .whitespaces).isEmpty
-                let keep: Bool
-                if line.trimmingCharacters(in: .whitespaces).isEmpty || prevEmpty {
-                    keep = true
-                } else if isHeadingLine(line) || isHeadingLine(lines[i - 1]) {
-                    // **見出し行は前後の改行を必ず残す。**
-                    // 行頭の記号だけを見ていると、見出しの「後ろ」の改行を守れない。
-                    // 次の行が字下げされていない本文だと、見出しが飲み込まれてしまう
-                    keep = true
-                } else if recognizeParagraphs, let first = line.first, isParagraphHead(first) {
-                    keep = true
-                } else {
-                    keep = false
-                }
-                if keep { out += "\n" }
+            if i > 0,
+               keepsNewline(between: lines[i - 1], and: line,
+                            recognizeParagraphs: recognizeParagraphs) {
+                out += "\n"
             }
             out += line
         }
         return out
+    }
+
+    /// 非整形が、この2行の間の改行を残すかどうか。**段落の切れ目の判定そのもの**なので、
+    /// 「カーソルのある段落だけを非整形する」ときの範囲決めからも同じ規則で呼ぶ。
+    /// ふつうの改行は切れ目にならない。切れ目になるのは次のどれか。
+    /// ・空行（空白だけの行も書き手には空行に見えるので同じ扱い）
+    /// ・見出し行の前後（行頭の記号だけ見ていると見出しの「後ろ」を守れない）
+    /// ・段落の印で始まる行（一字下げ・括弧・箇条書き記号・丸付き数字など）。
+    /// 　ただし recognizeParagraphs が false のときはこの判定をしない
+    static func keepsNewline(between prev: String, and line: String,
+                             recognizeParagraphs: Bool) -> Bool {
+        if line.trimmingCharacters(in: .whitespaces).isEmpty { return true }
+        if prev.trimmingCharacters(in: .whitespaces).isEmpty { return true }
+        if isHeadingLine(line) || isHeadingLine(prev) { return true }
+        if recognizeParagraphs, let first = line.first, isParagraphHead(first) { return true }
+        return false
     }
 
     /// 全角・半角スペースを行単位で除去する（原稿支援の除去処理の中核）。
@@ -602,6 +604,131 @@ enum TextTransform {
             acc += w
         }
         return out
+    }
+
+    // --------------------------------------------------------
+    // 変換コマンドが対象にする範囲
+    // --------------------------------------------------------
+
+    /// 何も選択されていないとき、変換コマンドが何を対象にするか。
+    enum NoSelectionScope {
+        /// 文書全体（非整形・空行除去・原稿支援・見出しの印を外す）
+        case wholeDocument
+        /// カーソルのある論理行だけ（整形）。
+        /// 「論理行」は画面上の折り返しではなく、行頭から改行までのひとまとまり
+        case currentLine
+        /// カーソルのある段落だけ（非整形）。
+        /// 段落の切れ目は [keepsNewline] が決める＝非整形が改行を残す場所と同じ。
+        /// ふつうの改行では切れないので、細切れの改行は1つの段落にまとまる
+        case currentParagraph
+    }
+
+    /// 変換の前後で、カーソルを「同じ文字」のところに保つための位置の対応づけ。
+    ///
+    /// 整形は改行を足すだけ、非整形は改行を取るだけで、どちらも他の文字は動かさない。
+    /// そこで2つの文字列を先頭から突き合わせ、増えた改行ぶんは進め、減った改行ぶんは
+    /// 飛ばす。offset は変換前の位置で、返り値は変換後の位置。
+    static func mappedCaret(from target: NSString, to replaced: NSString, offset: Int) -> Int {
+        let limit = max(0, min(offset, target.length))
+        var t = 0
+        var r = 0
+        while t < limit {
+            if r < replaced.length, replaced.character(at: r) == target.character(at: t) {
+                t += 1
+                r += 1
+            } else if r < replaced.length, replaced.character(at: r) == 0x0A {
+                r += 1                                  // 整形が足した改行
+            } else if target.character(at: t) == 0x0A {
+                t += 1                                  // 非整形が取った改行
+            } else {
+                // 改行以外が変わる変換（原稿支援など）は想定していない。
+                // ずれを最小にするため同じだけ進める
+                t += 1
+                if r < replaced.length { r += 1 }
+            }
+        }
+        return r
+    }
+
+    /// 変換コマンド（整形・非整形・空行除去・原稿支援）が実際に書き換える範囲を決める。
+    ///
+    /// 選択があるときは、行の途中から始まっていても・途中で終わっていても、
+    /// その行全体を選んだものとみなして行単位に広げる。
+    /// 選択がないときは scope に従う。
+    /// recognizeParagraphs は currentParagraph のときだけ意味を持ち、
+    /// 設定「非整形で段落を区別しない」を裏返した値（＝非整形へ渡すものと同じ）を受け取る。
+    static func targetRange(in text: NSString,
+                            selection: NSRange,
+                            noSelectionScope: NoSelectionScope,
+                            recognizeParagraphs: Bool = true) -> NSRange {
+        guard selection.length > 0 else {
+            switch noSelectionScope {
+            case .wholeDocument:
+                return NSRange(location: 0, length: text.length)
+            case .currentLine:
+                let caret = min(selection.location, text.length)
+                var line = text.lineRange(for: NSRange(location: caret, length: 0))
+                // その行をそっくり選んで実行したときと同じ範囲になるよう、行末の改行は含めない
+                while line.length > 0 {
+                    let last = text.character(at: NSMaxRange(line) - 1)
+                    guard last == 0x0A || last == 0x0D else { break }
+                    line.length -= 1
+                }
+                return line
+            case .currentParagraph:
+                return paragraphRange(in: text,
+                                      caret: min(selection.location, text.length),
+                                      recognizeParagraphs: recognizeParagraphs)
+            }
+        }
+        var range = selection
+        // 行の途中から始まる選択は行頭まで広げる
+        let lineStart = text.lineRange(for: NSRange(location: range.location, length: 0)).location
+        if lineStart < range.location {
+            range.length += range.location - lineStart
+            range.location = lineStart
+        }
+        // 行の途中で終わる選択は行末まで広げる
+        let end = NSMaxRange(range)
+        if end < text.length, end > 0, text.character(at: end - 1) != 0x0A {
+            let lineRange = text.lineRange(for: NSRange(location: end, length: 0))
+            var lineEnd = NSMaxRange(lineRange)
+            if lineEnd > 0 && text.character(at: lineEnd - 1) == 0x0A { lineEnd -= 1 }
+            if lineEnd > end { range.length = lineEnd - range.location }
+        }
+        return range
+    }
+
+    /// カーソルのある段落（＝非整形が改行を残す切れ目に挟まれたひとまとまり）の範囲。
+    /// 行末の改行は含めない。空行や見出しの上にカーソルがあるときは、その1行だけになる。
+    private static func paragraphRange(in text: NSString,
+                                       caret: Int,
+                                       recognizeParagraphs: Bool) -> NSRange {
+        let lines = text.components(separatedBy: "\n")
+        var starts = [Int](repeating: 0, count: lines.count)
+        var pos = 0
+        for i in lines.indices {
+            starts[i] = pos
+            pos += (lines[i] as NSString).length + 1     // +1 は行末の改行ぶん
+        }
+        // カーソルのある行。改行の上にカーソルがあるときは、その改行の手前の行とみなす
+        var index = 0
+        for i in lines.indices where starts[i] <= caret { index = i }
+        var first = index
+        var last = index
+        while first > 0,
+              !keepsNewline(between: lines[first - 1], and: lines[first],
+                            recognizeParagraphs: recognizeParagraphs) {
+            first -= 1
+        }
+        while last < lines.count - 1,
+              !keepsNewline(between: lines[last], and: lines[last + 1],
+                            recognizeParagraphs: recognizeParagraphs) {
+            last += 1
+        }
+        let start = starts[first]
+        let end = starts[last] + (lines[last] as NSString).length
+        return NSRange(location: start, length: end - start)
     }
 }
 
