@@ -389,6 +389,7 @@ final class Document: NSDocument, NSTextViewDelegate {
     private weak var encodingPopup: NSPopUpButton?
     private weak var lineEndingPopup: NSPopUpButton?
     private weak var autoSavePopup: NSPopUpButton?
+    private weak var wrapWidthPopup: NSPopUpButton?
     private weak var modeButton: NSButton?
     private weak var menuBarView: MenuBarView?
     private var matchListController: MatchListWindowController?
@@ -958,13 +959,33 @@ final class Document: NSDocument, NSTextViewDelegate {
         }
     }
 
+    /// 新規作成・オープンのときに「位置と大きさの基準にする既存ウインドウ」を返す。
+    ///
+    /// **タブでまとめていると、前面に出ていないタブのウインドウも isVisible は true を返す。**
+    /// しかもその枠は合流する前のものが残り、前面のタブを動かしても追随しない
+    /// （AppKitの挙動。小さなテストプログラムで確認済み）。素朴に「最初に見つかった
+    /// 表示中のウインドウ」を基準にすると、その古い枠を拾ってしまい、新規作成のたびに
+    /// ウインドウ全体が決まった場所へ飛ぶ。画面に見えている枠を持っているのは、
+    /// タブグループで選ばれているウインドウだけ。
     private static func anotherVisibleDocumentWindow(excluding window: NSWindow) -> NSWindow? {
+        var candidates: [NSWindow] = []
         for case let doc as Document in NSDocumentController.shared.documents {
             if let w = doc.windowControllers.first?.window, w !== window, w.isVisible {
-                return w
+                candidates.append(w)
             }
         }
-        return nil
+        /// いま画面に見えている枠を持っているか（タブなら選ばれている側だけが持つ）
+        func showsItsOwnFrame(_ w: NSWindow) -> Bool {
+            guard let group = w.tabGroup else { return true }
+            return group.selectedWindow === w
+        }
+        // 前面にあるウインドウがあればそれを基準にする（タブグループが複数あるときに、
+        // 見ていない側のグループへ合流させてしまわないため）
+        if let main = NSApp.mainWindow, candidates.contains(where: { $0 === main }),
+           showsItsOwnFrame(main) {
+            return main
+        }
+        return candidates.first(where: showsItsOwnFrame) ?? candidates.first
     }
 
     override func close() {
@@ -1220,6 +1241,15 @@ final class Document: NSDocument, NSTextViewDelegate {
         label.textColor = .secondaryLabelColor
         label.lineBreakMode = .byTruncatingTail
 
+        // 整形（⌃E）の字数。原稿の体裁を決める値で、書きながら変えることがあるため
+        // 設定パネルまで行かずにここで選べるようにしている（Windows版に合わせた配置）
+        let wrapWidthPopup = NSPopUpButton()
+        wrapWidthPopup.translatesAutoresizingMaskIntoConstraints = false
+        wrapWidthPopup.controlSize = .small
+        wrapWidthPopup.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
+        wrapWidthPopup.target = self
+        wrapWidthPopup.action = #selector(wrapWidthChanged(_:))
+
         // 自動保存の間隔。うっかり切り替わらないよう、その場のトグルではなく
         // 一覧から選び直す形にしている（文字コード・改行コードと同じ操作感）
         let autoSavePopup = NSPopUpButton()
@@ -1256,6 +1286,7 @@ final class Document: NSDocument, NSTextViewDelegate {
 
         statusBar.addSubview(separator)
         statusBar.addSubview(label)
+        statusBar.addSubview(wrapWidthPopup)
         statusBar.addSubview(autoSavePopup)
         statusBar.addSubview(encPopup)
         statusBar.addSubview(eolPopup)
@@ -1287,9 +1318,9 @@ final class Document: NSDocument, NSTextViewDelegate {
 
             label.leadingAnchor.constraint(equalTo: statusBar.leadingAnchor, constant: 12),
             label.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor),
-            label.trailingAnchor.constraint(lessThanOrEqualTo: autoSavePopup.leadingAnchor, constant: -12),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: wrapWidthPopup.leadingAnchor, constant: -12),
 
-            // 右端から「閲覧/編集」「改行コード」「文字コード」「自動保存」の順に並べる
+            // 右端から「閲覧/編集」「改行コード」「文字コード」「自動保存」「整形の字数」の順に並べる
             modeButton.trailingAnchor.constraint(equalTo: statusBar.trailingAnchor, constant: -10),
             modeButton.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor),
             eolPopup.trailingAnchor.constraint(equalTo: modeButton.leadingAnchor, constant: -8),
@@ -1298,6 +1329,8 @@ final class Document: NSDocument, NSTextViewDelegate {
             encPopup.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor),
             autoSavePopup.trailingAnchor.constraint(equalTo: encPopup.leadingAnchor, constant: -8),
             autoSavePopup.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor),
+            wrapWidthPopup.trailingAnchor.constraint(equalTo: autoSavePopup.leadingAnchor, constant: -8),
+            wrapWidthPopup.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor),
         ])
 
         self.textView = tv
@@ -1305,6 +1338,7 @@ final class Document: NSDocument, NSTextViewDelegate {
         self.encodingPopup = encPopup
         self.lineEndingPopup = eolPopup
         self.autoSavePopup = autoSavePopup
+        self.wrapWidthPopup = wrapWidthPopup
         self.modeButton = modeButton
         self.menuBarView = menuBar
 
@@ -1454,6 +1488,7 @@ final class Document: NSDocument, NSTextViewDelegate {
         }
         statusLabel?.stringValue = status
         syncAutoSavePopup()
+        syncWrapWidthPopup()
         modeButton?.title = readingMode ? "閲覧" : "編集"
     }
 
@@ -1487,6 +1522,42 @@ final class Document: NSDocument, NSTextViewDelegate {
         // 全ウインドウのタイマーと表示を張り直す
         for case let document as Document in NSDocumentController.shared.documents {
             document.scheduleAutoSaveTimer()
+            document.updateStatus()
+        }
+    }
+
+    /// 整形の字数の選択肢。5〜40字を1字きざみ。
+    /// 設定パネルの入力欄は1〜1000まで受け付けるので、一覧に無い値が入っている場合は
+    /// その値も足す（自動保存の間隔と同じ考え方。今の値が表示から消えないようにするため）
+    private func wrapWidthChoices() -> [Int] {
+        var choices = Array(5...40)
+        let current = UserDefaults.standard.integer(forKey: "wrapWidth")
+        if current > 0, !choices.contains(current) { choices.append(current) }
+        return choices.sorted()
+    }
+
+    private func syncWrapWidthPopup() {
+        guard let popup = wrapWidthPopup else { return }
+        let choices = wrapWidthChoices()
+        let titles = choices.map { "整形 \($0)字" }
+        if popup.itemTitles != titles {
+            popup.removeAllItems()
+            popup.addItems(withTitles: titles)
+        }
+        var current = UserDefaults.standard.integer(forKey: "wrapWidth")
+        if current <= 0 { current = 20 }
+        if let index = choices.firstIndex(of: current) {
+            popup.selectItem(at: index)
+        }
+    }
+
+    @objc private func wrapWidthChanged(_ sender: NSPopUpButton) {
+        let choices = wrapWidthChoices()
+        let index = sender.indexOfSelectedItem
+        guard index >= 0 && index < choices.count else { return }
+        UserDefaults.standard.set(choices[index], forKey: "wrapWidth")
+        // 設定パネルの入力欄と、他のウインドウの表示を合わせる
+        for case let document as Document in NSDocumentController.shared.documents {
             document.updateStatus()
         }
     }
@@ -1923,7 +1994,7 @@ final class Document: NSDocument, NSTextViewDelegate {
 
     @objc func wrapCommand(_ sender: Any?) {
         var count = UserDefaults.standard.integer(forKey: "wrapWidth")
-        if count <= 0 { count = 40 }
+        if count <= 0 { count = 20 }
         // 行の途中から／途中まで選択した場合も、applyTransformがその行全体へ広げる。
         // 選択が無いときは、文書全体ではなくカーソルのある論理行だけを整形する
         applyTransform({ TextTransform.wrap($0, limit: Double(count)) },
@@ -2228,7 +2299,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         UserDefaults.standard.register(defaults: [
-            "wrapWidth": 40,
+            "wrapWidth": 20,
             "fontSize": 16.0,
             "listFontSize": 12.0, // 検索結果一覧・推敲・目次の一覧に使う文字サイズ
             "showInvisibles": true,
@@ -2534,7 +2605,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                     stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
                     stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
                     stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+                    stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
                 ])
+                // **パネルの高さは中身に合わせて決める。** 以前は520×440の固定で、
+                // 項目を足していくうちに下のほうの行（「メニューの編集…」など）が
+                // パネルの下端で切れて見えなくなっていた。パネルは大きさを変えられないので、
+                // 切れた項目には手が届かない。項目を足しても必ず全体が見えるようにする。
+                // 幅は520のまま（保存フォルダのパスは中央を省略して収める）
+                content.layoutSubtreeIfNeeded()
+                panel.setContentSize(NSSize(width: 520, height: stack.fittingSize.height + 40))
             }
             panel.center()
             preferencesPanel = panel
