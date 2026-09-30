@@ -483,6 +483,9 @@ final class Document: NSDocument, NSTextViewDelegate {
 
     // ---------- 保存（⌘S はダイアログなしで1行目をファイル名にして保存） ----------
 
+    /// 全文検索のパネル。**アプリで1つだけ持つ**（文書ごとに持つと結果から開くたびに増える）
+    static var allTextSearchController: AllTextSearchWindowController?
+
     /// 設定された保存フォルダ（未設定なら ~/Documents）
     static var saveFolderURL: URL {
         if let path = UserDefaults.standard.string(forKey: "saveFolder"), !path.isEmpty {
@@ -575,6 +578,8 @@ final class Document: NSDocument, NSTextViewDelegate {
             }
             self.recordBaseline(at: target)
             self.addHistory(name: target.lastPathComponent, url: target)
+            HistoryStore.shared.snapshot(identity: HistoryStore.identity(of: target),
+                                         name: target.lastPathComponent, text: self.text, reason: .save)
             if let tv = self.textView {
                 let sel = tv.selectedRange()
                 RecentHistory.updatePosition(url: target, selStart: sel.location, selEnd: NSMaxRange(sel))
@@ -607,6 +612,8 @@ final class Document: NSDocument, NSTextViewDelegate {
             }
             self.recordBaseline(at: target)
             self.addHistory(name: target.lastPathComponent, url: target)
+            HistoryStore.shared.snapshot(identity: HistoryStore.identity(of: target),
+                                         name: target.lastPathComponent, text: self.text, reason: .save)
             self.updateStatus()
         }
     }
@@ -653,6 +660,9 @@ final class Document: NSDocument, NSTextViewDelegate {
             self.conflictHold = false
             self.bigChangeHold = false
             self.recordBaseline(at: url)
+            HistoryStore.shared.snapshot(identity: HistoryStore.identity(of: url),
+                                         name: url.lastPathComponent, text: self.text,
+                                         reason: fromAutoSave ? .auto : .save)
             if let tv = self.textView {
                 let sel = tv.selectedRange()
                 RecentHistory.updatePosition(url: url, selStart: sel.location, selEnd: NSMaxRange(sel))
@@ -746,6 +756,8 @@ final class Document: NSDocument, NSTextViewDelegate {
             }
             self.recordBaseline(at: target)
             self.addHistory(name: target.lastPathComponent, url: target)
+            HistoryStore.shared.snapshot(identity: HistoryStore.identity(of: target),
+                                         name: target.lastPathComponent, text: self.text, reason: .save)
             self.updateStatus()
         }
     }
@@ -828,6 +840,9 @@ final class Document: NSDocument, NSTextViewDelegate {
         fileURL = newURL
         synchronizeWindowTitle()
         addHistory(name: newName, url: newURL)
+        // 版の履歴も新しい名前へ移す（移さないと、名前を変えた途端に履歴が見えなくなる）
+        HistoryStore.shared.move(from: HistoryStore.identity(of: oldURL),
+                                 to: HistoryStore.identity(of: newURL), name: newName)
         // 内容は変わっていないので、基準の日時・サイズだけ取り直す（ハッシュ・文字数は既存のまま）
         let attrs = try? FileManager.default.attributesOfItem(atPath: newURL.path)
         baseModified = attrs?[.modificationDate] as? Date
@@ -1600,7 +1615,8 @@ final class Document: NSDocument, NSTextViewDelegate {
     /// 選択が無いときに何を対象にするかは noSelectionScope で決める。
     private func applyTransform(_ transform: (String) -> String,
                                 noSelectionScope: TextTransform.NoSelectionScope = .wholeDocument,
-                                recognizeParagraphs: Bool = true) {
+                                recognizeParagraphs: Bool = true,
+                                historyReason: VersionHistory.Reason? = nil) {
         guard let tv = textView else { return }
         let full = tv.string as NSString
         let selection = tv.selectedRange()
@@ -1613,6 +1629,12 @@ final class Document: NSDocument, NSTextViewDelegate {
         let target = full.substring(with: range)
         let replaced = transform(target)
         guard replaced != target else { return }
+        // **書き換える直前の本文を丸ごと版に残す。** 「原稿支援の前に戻す」を選べるようにするため
+        // （元に戻すでは、原稿支援のような一括の書き換えは一度に戻りすぎることがある）
+        if let reason = historyReason, let url = fileURL {
+            HistoryStore.shared.snapshot(identity: HistoryStore.identity(of: url),
+                                         name: url.lastPathComponent, text: full as String, reason: reason)
+        }
         tv.insertText(replaced, replacementRange: range)
         // 変換後は選択を解除する。カーソルは、選択して実行したときは対象の先頭へ、
         // 文書全体に実行したときは元の位置へ寄せて、画面が大きく飛ばないようにする
@@ -1637,7 +1659,8 @@ final class Document: NSDocument, NSTextViewDelegate {
         let noParagraphDetect = UserDefaults.standard.bool(forKey: "noParagraphDetect")
         applyTransform({ TextTransform.removeNewlines($0, recognizeParagraphs: !noParagraphDetect) },
                        noSelectionScope: .currentParagraph,
-                       recognizeParagraphs: !noParagraphDetect)
+                       recognizeParagraphs: !noParagraphDetect,
+                       historyReason: .unwrap)
     }
 
     /// 原稿支援。書き上げたあとの体裁を整える処理をダイアログでまとめて選び、1回で適用する。
@@ -1812,7 +1835,7 @@ final class Document: NSDocument, NSTextViewDelegate {
         )
         // 何も選ばれていなければ何もしない
         guard options.hasAnyAction else { return }
-        applyTransform { TextTransform.assist($0, options: options) }
+        applyTransform({ TextTransform.assist($0, options: options) }, historyReason: .assist)
     }
 
     /// 原稿支援ダイアログの横幅（説明文の折り返し幅もここから決める）
@@ -1984,12 +2007,12 @@ final class Document: NSDocument, NSTextViewDelegate {
     /// 印をすべて外す。入稿の直前に使う。
     /// これを通したファイルなら、画面の字数と受け取った側で数えた字数が一致する。
     @objc func stripHeadingMarksCommand(_ sender: Any?) {
-        applyTransform { Outline.stripMarks($0) }
+        applyTransform({ Outline.stripMarks($0) }, historyReason: .strip)
     }
 
     /// 改行のみの行を1段階ぶん削除する（連続する空行は1回につき1行ずつ詰まる）
     @objc func removeBlankLinesCommand(_ sender: Any?) {
-        applyTransform { TextTransform.removeBlankLinesStep($0) }
+        applyTransform({ TextTransform.removeBlankLinesStep($0) }, historyReason: .blank)
     }
 
     @objc func wrapCommand(_ sender: Any?) {
@@ -1998,7 +2021,8 @@ final class Document: NSDocument, NSTextViewDelegate {
         // 行の途中から／途中まで選択した場合も、applyTransformがその行全体へ広げる。
         // 選択が無いときは、文書全体ではなくカーソルのある論理行だけを整形する
         applyTransform({ TextTransform.wrap($0, limit: Double(count)) },
-                       noSelectionScope: .currentLine)
+                       noSelectionScope: .currentLine,
+                       historyReason: .wrap)
     }
 
     // ---------- 日付・時刻の挿入 ----------
@@ -2043,6 +2067,101 @@ final class Document: NSDocument, NSTextViewDelegate {
 
     /// 検索結果一覧（Android版の「一覧」ボタンと同じ機能）。
     /// 初期の検索語はシステム共通の検索文字列（⌘Fや⌘Eで使われるもの）を引き継ぐ。
+    /// 版の履歴パネル。文書ごとに1つ
+    private var versionHistoryController: VersionHistoryWindowController?
+
+    /// 版の履歴パネルの本文に使う字（本文と同じ書体にする）
+    var editorFont: NSFont? { textView?.font }
+
+    /// 「版の履歴…」。いま開いている文書の、残してある版を新しい順に並べる
+    @objc func showVersionHistory(_ sender: Any?) {
+        guard let url = fileURL else {
+            let alert = NSAlert()
+            alert.messageText = "保存すると、版が残るようになります"
+            alert.informativeText = "名前のない（まだ保存していない）文書には、版は残りません。"
+            if let window = windowControllers.first?.window {
+                alert.beginSheetModal(for: window)
+            } else {
+                alert.runModal()
+            }
+            return
+        }
+        if let existing = versionHistoryController, existing.window?.isVisible == true {
+            existing.reload()
+            existing.window?.makeKeyAndOrderFront(nil)
+            return
+        }
+        let controller = VersionHistoryWindowController(
+            document: self, identity: HistoryStore.identity(of: url), title: url.lastPathComponent)
+        versionHistoryController = controller
+        controller.window?.center()
+        controller.showWindow(nil)
+    }
+
+    /// 版に戻す。**ふつうの書き換えとして差し替える**ので、「元に戻す」で戻せる。
+    /// さらに、差し替える前の本文も版として残しておく（戻したことを後悔しても取り戻せるように）。
+    /// ファイルへは、いつもの保存・自動保存のときに書かれる。差し替えたら true
+    func restoreVersion(text: String, identity: String) -> Bool {
+        guard let tv = textView, let url = fileURL else { return false }
+        let current = tv.string
+        if current == text { return false }
+        // 一覧にすぐ出るよう、戻す前の版は待って書く（背景に回すと一覧の読み直しに間に合わない）
+        HistoryStore.shared.write(identity: identity, name: url.lastPathComponent, text: current,
+                                  reason: .restore, now: Int64(Date().timeIntervalSince1970 * 1000))
+        tv.insertText(text, replacementRange: NSRange(location: 0, length: (current as NSString).length))
+        tv.setSelectedRange(NSRange(location: 0, length: 0))
+        tv.scrollToBeginningOfDocument(nil)
+        updateStatus()
+        return true
+    }
+
+    /// 全文検索。保存フォルダのすべてのファイルから探す。
+    /// 一覧は閉じずに出したままにするので、行を押して文書へ移ったあとも同じ一覧に戻れる
+    @objc func showAllTextSearch(_ sender: Any?) {
+        let saved = UserDefaults.standard.string(forKey: "saveFolder") ?? ""
+        if saved.isEmpty {
+            let alert = NSAlert()
+            alert.messageText = "保存フォルダが決まっていません"
+            alert.informativeText = "設定（⌘,）の「保存フォルダを選択…」で決めてください。"
+            alert.runModal()
+            return
+        }
+        let initialQuery = NSPasteboard(name: .find).string(forType: .string) ?? ""
+        if let existing = Document.allTextSearchController, existing.window != nil {
+            existing.window?.makeKeyAndOrderFront(nil)
+            return
+        }
+        let controller = AllTextSearchWindowController(initialQuery: initialQuery)
+        // **パネルは文書ごとではなくアプリで1つ。** 文書を開くたびに増えると、
+        // 結果から開いた先でまた別の一覧が出てしまう
+        Document.allTextSearchController = controller
+        controller.window?.center()
+        controller.showWindow(nil)
+    }
+
+    /// 全文検索へ渡す、いま画面に出ている本文（まだ保存していない書きかけも探せるように）
+    func currentTextForSearch() -> NSString? {
+        textView.map { $0.string as NSString }
+    }
+
+    /// 全文検索の結果から開いたとき、見つかった所を選んで見せる。
+    /// 一覧を作ったあとで本文が変わっていることもあるので、**開いた本文で探し直して
+    /// 控えた位置にいちばん近い当たり**を選ぶ
+    func revealSearchHit(near: Int, terms: [[UInt16]], word: String) {
+        guard let tv = textView else { return }
+        // その文書の中の次の箇所へ ⌘G で進めるよう、実際に見つかった文字を検索語にしておく
+        if !word.isEmpty {
+            NSPasteboard(name: .find).clearContents()
+            NSPasteboard(name: .find).setString(word, forType: .string)
+        }
+        let full = tv.string as NSString
+        let hits = TextSearch.find(full, terms: terms)
+        guard let hit = hits.min(by: { abs($0.location - near) < abs($1.location - near) }) else { return }
+        tv.setSelectedRange(hit)
+        preservingScrollTop(tv) { tv.scrollRangeToVisible(hit) }
+        updateStatus()
+    }
+
     @objc func showMatchList(_ sender: Any?) {
         guard let tv = textView else { return }
         let initialQuery = NSPasteboard(name: .find).string(forType: .string) ?? ""
@@ -2101,6 +2220,7 @@ final class Document: NSDocument, NSTextViewDelegate {
             "time": { [weak self] in self?.insertTimeCommand(nil) },
             "search": { [weak self] in self?.showFindInterface() },
             "matchlist": { [weak self] in self?.showMatchList(nil) },
+            "allsearch": { [weak self] in self?.showAllTextSearch(nil) },
             "wrap": { [weak self] in self?.wrapCommand(nil) },
             "removenl": { [weak self] in self?.removeNewlinesCommand(nil) },
             "blankline": { [weak self] in self?.removeBlankLinesCommand(nil) },
@@ -2122,6 +2242,7 @@ final class Document: NSDocument, NSTextViewDelegate {
         let menu = NSMenu()
         menu.addItem(withTitle: "別名保存", action: #selector(saveAs(_:)), keyEquivalent: "")
         menu.addItem(withTitle: "ファイル名変更…", action: #selector(renameCommand(_:)), keyEquivalent: "")
+        menu.addItem(withTitle: "版の履歴…", action: #selector(showVersionHistory(_:)), keyEquivalent: "")
         menu.addItem(withTitle: "印刷…", action: #selector(NSDocument.printDocument(_:)), keyEquivalent: "")
         menu.addItem(withTitle: "保存せず閉じる", action: #selector(closeDiscardingChanges(_:)), keyEquivalent: "")
         menu.addItem(.separator())
@@ -2322,6 +2443,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         promptInitialSaveFolderIfNeeded()
+        // 元のファイルが消えた版の履歴を片付ける。起動のたびに回るが、1日に1回で足りる
+        let today = ISO8601DateFormatter.string(from: Date(), timeZone: .current,
+                                                formatOptions: [.withFullDate])
+        if UserDefaults.standard.string(forKey: "historyCleanupDay") != today {
+            UserDefaults.standard.set(today, forKey: "historyCleanupDay")
+            HistoryStore.shared.cleanupOrphans()
+        }
     }
 
     /// 初回起動時（保存フォルダが未設定かつこの案内をまだ出したことがない場合）だけ、
@@ -2759,6 +2887,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             Ctrl+Z　取り消す
             Ctrl+Y　やり直す
             Ctrl+F　検索
+            Ctrl+Shift+F　全文検索
             Ctrl+R　非整形
             Ctrl+E　整形
             Ctrl+L　空行除去（連続する空行は1回に1行ずつ）
@@ -2988,6 +3117,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         renameShift.keyEquivalentModifierMask = [.control, .shift]
         renameShift.isHidden = true
         renameShift.allowsKeyEquivalentWhenHidden = true
+        fileMenu.addItem(withTitle: "版の履歴…",
+                         action: #selector(Document.showVersionHistory(_:)), keyEquivalent: "")
         fileMenu.addItem(withTitle: "最後に保存した状態に戻す",
                          action: #selector(NSDocument.revertToSaved(_:)), keyEquivalent: "")
         fileMenu.addItem(.separator())
@@ -3131,6 +3262,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                                              action: #selector(Document.showMatchList(_:)),
                                              keyEquivalent: "f")
         matchListItem.keyEquivalentModifierMask = [.command, .shift]
+        // 全文検索。**Fの⌘系は3つとも埋まっている**（⌘F検索・⌘⇧F一覧・⌘⌥F置換）ため
+        // ⌘⌃Fに置き、Android版と同じ Ctrl+Shift+F も効くように隠し項目で重ねる
+        let allSearchItem = findMenu.addItem(withTitle: "全文検索…",
+                                             action: #selector(Document.showAllTextSearch(_:)),
+                                             keyEquivalent: "f")
+        allSearchItem.keyEquivalentModifierMask = [.command, .control]
+        let allSearchCtrl = findMenu.addItem(withTitle: "全文検索…",
+                                             action: #selector(Document.showAllTextSearch(_:)),
+                                             keyEquivalent: "f")
+        allSearchCtrl.keyEquivalentModifierMask = [.control, .shift]
+        allSearchCtrl.isHidden = true
+        // **隠した項目は、これが無いとキーに反応しない**（ほかの隠し項目と同じ手当て）
+        allSearchCtrl.allowsKeyEquivalentWhenHidden = true
 
         let findMenuItem = NSMenuItem(title: "検索", action: nil, keyEquivalent: "")
         findMenuItem.submenu = findMenu

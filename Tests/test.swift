@@ -1071,6 +1071,149 @@ checkI("カーソル_先頭は動かない",
 checkI("カーソル_末尾は変換後の末尾へ",
        caretAfter("あいうえおかきくけこ", 10) { TextTransform.wrap($0, limit: 5) }, 11)
 
+// ============================================================
+// 全文検索の探し方（Android版 TextSearchTest と同じケース）
+// ============================================================
+
+func 探す(_ text: String, _ query: String) -> [String] {
+    let ns = text as NSString
+    return TextSearch.find(ns, terms: TextSearch.terms(query)).map { ns.substring(with: $0) }
+}
+
+checkArr("探す_全角半角と大小は区別しない1", 探す("ＵＲＬを貼る。Urlも", "url"), ["ＵＲＬ", "Url"])
+checkArr("探す_全角半角と大小は区別しない2", 探す("abcの話", "ＡＢＣ"), ["abc"])
+checkArr("探す_全角半角と大小は区別しない3", 探す("番号は１２３", "123"), ["１２３"])
+checkArr("探す_半角カナと濁点1", 探す("今日はｶﾞｽ代を払った", "ガス"), ["ｶﾞｽ"])
+checkArr("探す_半角カナと濁点2", 探す("ガスの点検", "ｶﾞｽ"), ["ガス"])
+checkArr("探す_ひらがなとカタカナは別", 探す("かき氷", "カキ"), [])
+checkArr("探す_空白はどれも含む1", 探す("京都へ行った。雨だった", "京都 雨"), ["京都", "雨"])
+checkArr("探す_空白はどれも含む2_全角スペース", 探す("京都へ行った。雨だった", "京都　雨"), ["京都", "雨"])
+checkArr("探す_空白はどれも含む3_片方無し", 探す("京都へ行った。晴れ", "京都 雨"), [])
+checkArr("探す_重なった当たりはまとめる", 探す("京都", "京都 都"), ["京都"])
+checkArr("探す_当たりは前から順", 探す("雨の京都、京都の雨", "京都 雨"), ["雨", "京都", "京都", "雨"])
+checkB("探す_空の言葉では何も探さない1", TextSearch.terms("  　 ").isEmpty, true)
+checkArr("探す_空の言葉では何も探さない2", 探す("何か", " "), [])
+checkArr("探す_異体字セレクタは無いものとして探す",
+         探す("𠮷󠄀野家へ行った", "𠮷野家"), ["𠮷󠄀野家"])
+checkArr("探す_言葉の側のセレクタも無いものとする",
+         探す("𠮷野家へ行った", "𠮷󠄀野家"), ["𠮷野家"])
+
+// -- 抜粋
+func 抜粋(_ text: String, _ query: String) -> TextSearch.Snippet {
+    let ns = text as NSString
+    return TextSearch.snippet(ns, hits: TextSearch.find(ns, terms: TextSearch.terms(query)))
+}
+let 長い段落 = "一行目\n" + String(repeating: "あ", count: 30) + "京都へ行った"
+    + String(repeating: "い", count: 60) + "\n三行目"
+let 抜粋1 = 抜粋(長い段落, "京都")
+checkB("抜粋_前に省略記号", 抜粋1.text.hasPrefix("…あ"), true)
+checkB("抜粋_後ろに省略記号", 抜粋1.text.hasSuffix("い…"), true)
+checkB("抜粋_段落をまたがない", 抜粋1.text.contains("\n"), false)
+check("抜粋_当たりの位置", (抜粋1.text as NSString).substring(with: 抜粋1.hits[0]), "京都")
+let 抜粋2 = 抜粋("京都へ行った。", "京都")
+check("抜粋_段落の頭なら省略記号なし", 抜粋2.text, "京都へ行った。")
+checkI("抜粋_段落の頭の当たりの位置", 抜粋2.hits[0].location, 0)
+check("抜粋_段落の終わり近くなら前を多めに",
+      抜粋(String(repeating: "う", count: 60) + "京都", "京都").text,
+      "…" + String(repeating: "う", count: 52) + "京都")
+
+// ============================================================
+// 版の履歴（Android版 VersionHistoryTest と同じケース）
+// ============================================================
+
+let 版の暦: Calendar = {
+    var c = Calendar(identifier: .gregorian)
+    c.timeZone = TimeZone(identifier: "Asia/Tokyo")!
+    return c
+}()
+func 時刻(_ y: Int, _ mo: Int, _ d: Int, _ h: Int, _ mi: Int = 0) -> Int64 {
+    let date = 版の暦.date(from: DateComponents(year: y, month: mo, day: d, hour: h, minute: mi))!
+    return Int64(date.timeIntervalSince1970 * 1000)
+}
+let 版の今 = 時刻(2026, 9, 30, 12)
+/// 新しい10個を必ず残す決まりが邪魔しないよう、新しい版を10個足しておく
+func 新しい版つき(_ old: Int64...) -> [Int64] {
+    (1...10).map { 版の今 - Int64($0) * 60_000 } + old
+}
+
+// -- 名前の付け方
+let 版の名前 = VersionHistory.fileName(time: 1759200000123, reason: .assist, chars: 12345, hash: "ab12cd34")
+check("版_ファイル名", 版の名前, "1759200000123_assist_12345_ab12cd34.deflate")
+let 版の読み戻し = VersionHistory.parse(版の名前)
+checkB("版_読み戻せる", 版の読み戻し != nil, true)
+checkI("版_読み戻した字数", 版の読み戻し?.chars ?? -1, 12345)
+check("版_読み戻したきっかけ", 版の読み戻し?.reason.label ?? "", "原稿支援の前")
+checkB("版_形の違う名前1", VersionHistory.parse("name.txt") == nil, true)
+checkB("版_形の違う名前2", VersionHistory.parse("123_assist_1_ab12cd34.gz") == nil, true)
+checkB("版_形の違う名前3", VersionHistory.parse("x_assist_1_ab12cd34.deflate") == nil, true)
+checkB("版_形の違う名前4", VersionHistory.parse("123_unknown_1_ab12cd34.deflate") == nil, true)
+checkB("版_形の違う名前5", VersionHistory.parse("123_assist_1_short.deflate") == nil, true)
+checkI("版_目印は8文字", VersionHistory.hashOf("吾輩は猫である。").count, 8)
+checkB("版_同じ中身なら同じ目印", VersionHistory.hashOf("吾輩は猫である。") == VersionHistory.hashOf("吾輩は猫である。"), true)
+checkB("版_違う中身なら違う目印", VersionHistory.hashOf("吾輩は猫である。") == VersionHistory.hashOf("吾輩は犬である。"), false)
+checkI("版_置き場所の名前は16文字", VersionHistory.keyOf("/Users/x/a.txt").count, 16)
+checkB("版_場所ごとに違う置き場所", VersionHistory.keyOf("/Users/x/a.txt") == VersionHistory.keyOf("/Users/x/b.txt"), false)
+// 「デ」の合成形（U+30C7）と分解形（U+30C6 U+3099）で、同じ置き場所になること
+checkB("版_合成形と分解形で同じ置き場所",
+       VersionHistory.keyOf("/Users/x/\u{30C7}ータ.txt") == VersionHistory.keyOf("/Users/x/\u{30C6}\u{3099}ータ.txt"), true)
+
+// -- 縮める・戻す
+let 版の長文 = String(repeating: "吾輩は猫である。名前はまだ無い。\nどこで生れたかとんと見当がつかぬ。\n", count: 200)
+let 版の縮めたもの = VersionHistory.compress(版の長文)!
+checkB("版_半分より小さく縮む", 版の縮めたもの.count < Data(版の長文.utf8).count / 2, true)
+check("版_縮めて戻すと元に戻る", VersionHistory.decompress(版の縮めたもの) ?? "", 版の長文)
+check("版_空の本文も戻せる", VersionHistory.decompress(VersionHistory.compress("")!) ?? "×", "")
+let 版の特殊文字 = "𠮷󠄀野家で🍜を食べた"
+check("版_絵文字や異体字セレクタも崩れない",
+      VersionHistory.decompress(VersionHistory.compress(版の特殊文字)!) ?? "", 版の特殊文字)
+checkB("版_壊れたものは戻さない", VersionHistory.decompress(Data([1, 2, 3, 4, 5])) == nil, true)
+
+// -- 元のファイルが消えた履歴を消す時期
+checkB("版_翌年の同じ日のうちはまだ消さない",
+       VersionHistory.orphanExpired(lastTime: 時刻(2026, 9, 30, 15), now: 時刻(2027, 9, 30, 23, 59), calendar: 版の暦), false)
+checkB("版_翌年の同じ日を過ぎたら消す",
+       VersionHistory.orphanExpired(lastTime: 時刻(2026, 9, 30, 15), now: 時刻(2027, 10, 1, 0), calendar: 版の暦), true)
+checkB("版_一年たっていなければ消さない",
+       VersionHistory.orphanExpired(lastTime: 時刻(2026, 9, 30, 15), now: 時刻(2027, 3, 1, 12), calendar: 版の暦), false)
+checkB("版_うるう日の版は翌年の二月二十八日のうちは消さない",
+       VersionHistory.orphanExpired(lastTime: 時刻(2028, 2, 29, 9), now: 時刻(2029, 2, 28, 23, 59), calendar: 版の暦), false)
+checkB("版_うるう日の版は三月一日から消す",
+       VersionHistory.orphanExpired(lastTime: 時刻(2028, 2, 29, 9), now: 時刻(2029, 3, 1, 0), calendar: 版の暦), true)
+
+// -- 間引き方
+checkB("版_空なら何も残さない", VersionHistory.toKeep([], now: 版の今, calendar: 版の暦).isEmpty, true)
+let 版の半日 = (1...30).map { 版の今 - Int64($0) * 30 * 60_000 }
+checkB("版_二十四時間以内は全部残す",
+       VersionHistory.toKeep(版の半日, now: 版の今, calendar: 版の暦) == Set(版の半日), true)
+do {
+    let a = 時刻(2026, 9, 28, 10, 5), b = 時刻(2026, 9, 28, 10, 30), c = 時刻(2026, 9, 28, 10, 50)
+    let kept = VersionHistory.toKeep(新しい版つき(a, b, c), now: 版の今, calendar: 版の暦)
+    checkB("版_七日以内は一時間に一つ", kept.contains(c) && !kept.contains(a) && !kept.contains(b), true)
+}
+do {
+    let a = 時刻(2026, 8, 31, 9), b = 時刻(2026, 8, 31, 21)
+    let kept = VersionHistory.toKeep(新しい版つき(a, b), now: 版の今, calendar: 版の暦)
+    checkB("版_九十日以内は一日に一つ", kept.contains(b) && !kept.contains(a), true)
+}
+do {
+    // 2026-03-02（月）と 2026-03-05（木）は同じ週
+    let a = 時刻(2026, 3, 2, 9), b = 時刻(2026, 3, 5, 9)
+    let kept = VersionHistory.toKeep(新しい版つき(a, b), now: 版の今, calendar: 版の暦)
+    checkB("版_それより前は一週に一つ", kept.contains(b) && !kept.contains(a), true)
+}
+do {
+    let a = 時刻(2026, 3, 2, 9), b = 時刻(2026, 3, 12, 9)
+    let kept = VersionHistory.toKeep(新しい版つき(a, b), now: 版の今, calendar: 版の暦)
+    checkB("版_違う週なら両方残す", kept.contains(a) && kept.contains(b), true)
+}
+do {
+    let base = 時刻(2025, 9, 1, 9)
+    let times = (0..<12).map { base + Int64($0) * 60_000 }
+    let kept = VersionHistory.toKeep(times, now: 版の今, calendar: 版の暦)
+    checkI("版_新しい十個は古くても残す", kept.count, 10)
+    checkB("版_いちばん新しい版は残る", kept.contains(times.max()!), true)
+}
+
 if failures == 0 {
     print("\nすべてのテストに合格")
 } else {

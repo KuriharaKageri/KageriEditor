@@ -74,6 +74,8 @@ final class MenuBarView: NSView {
         ("time", "時刻"),
         ("search", "検索"),
         ("matchlist", "一覧"),
+        // 保存フォルダのすべてを探す（Android版の検索バーの「全文書」に相当）
+        ("allsearch", "全文"),
         ("wrap", "整形"),
         ("removenl", "非整形"),
         ("blankline", "空行除去"),
@@ -93,7 +95,7 @@ final class MenuBarView: NSView {
     static let defaultOrder: [String] = [
         "new", "memo", "open", "history", "spacer",
         "selectall", "cut", "copy", "paste", "spacer",
-        "search", "matchlist", "spacer",
+        "search", "matchlist", "allsearch", "spacer",
         "date", "time", "spacer",
         "undo", "redo", "spacer",
         "wrap", "removenl", "blankline", "removespace", "proofread", "headingmark", "outline", "spacer",
