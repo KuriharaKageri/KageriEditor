@@ -221,6 +221,17 @@ check("スラッシュ・コロンは全角に置換",
 check("冒頭の空行は読み飛ばして次の行を名前にする",
       FileNaming.fileName(fromFirstLineOf: "\n本文"),
       "本文")
+// Windows の予約名は英数字を全角にする（Windows版と同じ規則）
+check("予約名 CON は全角に", FileNaming.fileName(fromFirstLineOf: "CON"), "ＣＯＮ")
+check("予約名は大文字小文字を問わない", FileNaming.fileName(fromFirstLineOf: "nul"), "ｎｕｌ")
+check("予約名 COM1・LPT9 も全角に", FileNaming.fileName(fromFirstLineOf: "COM1\nLPT9"), "ＣＯＭ１")
+check("最初のドットより前が予約名なら全角に", FileNaming.avoidReservedName("CON.決意"), "ＣＯＮ.決意")
+check("末尾の空白を除いて見分ける", FileNaming.avoidReservedName("NUL .メモ"), "ＮＵＬ .メモ")
+check("CONIN$ も全角に", FileNaming.avoidReservedName("CONIN$"), "ＣＯＮＩＮ＄")
+check("上付きの数字つきも全角に", FileNaming.avoidReservedName("COM¹"), "ＣＯＭ¹")
+check("予約名に似ているだけの名前はそのまま", FileNaming.avoidReservedName("CONSOLE"), "CONSOLE")
+check("COM10 や COMA はそのまま", FileNaming.avoidReservedName("COM10"), "COM10")
+check("日本語の名前はそのまま", FileNaming.avoidReservedName("会議メモ"), "会議メモ")
 check("冒頭の空白だけの行も読み飛ばす",
       FileNaming.fileName(fromFirstLineOf: "  \n本文"),
       "本文")
@@ -1113,9 +1124,131 @@ check("抜粋_当たりの位置", (抜粋1.text as NSString).substring(with: �
 let 抜粋2 = 抜粋("京都へ行った。", "京都")
 check("抜粋_段落の頭なら省略記号なし", 抜粋2.text, "京都へ行った。")
 checkI("抜粋_段落の頭の当たりの位置", 抜粋2.hits[0].location, 0)
+check("抜粋_前の切れ目が文字の途中ならその文字を含める",
+      String(抜粋("あああ𠮷" + String(repeating: "あ", count: 11) + "京都" + String(repeating: "い", count: 60), "京都").text.prefix(3)),
+      "…𠮷あ")
+checkB("抜粋_後ろの切れ目が文字の途中ならその文字を含める",
+       抜粋("京都" + String(repeating: "あ", count: 39) + "𠮷" + String(repeating: "い", count: 10), "京都").text.hasSuffix("あ𠮷…"),
+       true)
 check("抜粋_段落の終わり近くなら前を多めに",
       抜粋(String(repeating: "う", count: 60) + "京都", "京都").text,
       "…" + String(repeating: "う", count: 52) + "京都")
+
+// ============================================================
+// 本文のURL（Windows版 UrlLinksTest・Android版 UrlLinksTest と同じケース）
+// ============================================================
+
+func URLs(_ text: String) -> [String] {
+    let ns = text as NSString
+    return UrlLinks.find(text).map { ns.substring(with: $0) }
+}
+func URL検査(_ name: String, _ text: String, _ expected: String) {
+    checkArr("URL_" + name, URLs(text), [expected])
+}
+URL検査("ふつう", "https://example.com", "https://example.com")
+do {
+    let text = "詳しくは https://example.com/a をどうぞ"
+    let r = UrlLinks.find(text)
+    checkI("URL_位置は返る_個数", r.count, 1)
+    checkI("URL_位置_始まり", r[0].location, 5)
+    checkI("URL_位置_長さ", r[0].length, "https://example.com/a".utf16.count)
+}
+URL検査("日本語_句読点", "参照：https://example.com/a?b=1。続き", "https://example.com/a?b=1")
+URL検査("日本語_読点", "https://example.com/path、または別のページ", "https://example.com/path")
+URL検査("日本語_全角かっこ", "（https://example.com）を見てください", "https://example.com")
+URL検査("日本語_かぎかっこ", "「https://example.com/x」と書かれていた", "https://example.com/x")
+URL検査("日本語_すぐ後ろの文字", "https://example.comを開く", "https://example.com")
+for tail in [".", ",", ";", ":", "!", "?", "..."] {
+    URL検査("末尾の記号 \(tail)", "https://example.com/path" + tail, "https://example.com/path")
+}
+URL検査("末尾のシングルクォート", "'https://example.com/path'", "https://example.com/path")
+URL検査("末尾のダブルクォート", "\"https://example.com/path\"", "https://example.com/path")
+URL検査("かっこ_外のかっこ", "(see https://example.com/a)", "https://example.com/a")
+URL検査("かっこ_対のかっこ", "https://en.wikipedia.org/wiki/Foo_(bar)", "https://en.wikipedia.org/wiki/Foo_(bar)")
+URL検査("かっこ_二重", "(https://en.wikipedia.org/wiki/Foo_(bar))", "https://en.wikipedia.org/wiki/Foo_(bar)")
+URL検査("かっこ_角かっこ", "[https://example.com/a]", "https://example.com/a")
+URL検査("かっこ_Markdown", "[x](https://example.com/c)", "https://example.com/c")
+URL検査("かっこ_角かっこ対", "https://example.com/a?x[]=1", "https://example.com/a?x[]=1")
+URL検査("文字_fragment", "http://localhost:8080/path#frag", "http://localhost:8080/path#frag")
+URL検査("文字_query", "https://example.com/a?x=1&y=2", "https://example.com/a?x=1&y=2")
+URL検査("文字_パーセント", "https://example.com/%E3%81%82", "https://example.com/%E3%81%82")
+URL検査("文字_ユーザー", "https://user@example.com/~me/a_b-c.d", "https://user@example.com/~me/a_b-c.d")
+URL検査("文字_大文字", "HTTPS://EXAMPLE.COM/A", "HTTPS://EXAMPLE.COM/A")
+URL検査("文字_先頭だけ大文字", "Http://example.com", "Http://example.com")
+checkArr("URL_複数", URLs("https://a.example/x、あるいは http://b.example/y を参照"),
+         ["https://a.example/x", "http://b.example/y"])
+URL検査("行をまたがない", "https://example.com/a\nこれは次の行\nhttps", "https://example.com/a")
+URL検査("空白で切れる", "https://example.com/a b", "https://example.com/a")
+for text in ["", "ただの文章です。", "http://", "https://", "https:// example.com", "https://日本語.jp",
+             "https:///path", "ftp://example.com", "file:///C:/Windows", "mailto:a@example.com",
+             "www.example.com", "javascript:alert(1)", "xhttps://example.com", "httpx://example.com",
+             "http:/example.com"] {
+    checkB("URL_URLとみなさない「\(text)」", UrlLinks.find(text).isEmpty, true)
+}
+URL検査("前が日本語", "アドレスはhttps://example.com", "https://example.com")
+checkArrI("URL_位置は昇順", UrlLinks.find("https://a.example/aaa https://b.example").map { $0.location }, [0, 22])
+URL検査("URLの中のhttp", "https://web.archive.org/web/2020/https://example.com/a",
+        "https://web.archive.org/web/2020/https://example.com/a")
+checkI("URL_カンマでつないだ2つは1つ", UrlLinks.find("https://a.example/x,https://b.example/y").count, 1)
+checkArr("URL_長い文章",
+         URLs(String(repeating: "これは長い文章です。", count: 5000) + "https://example.com/end"),
+         ["https://example.com/end"])
+// 閲覧モードの [文字](URL)
+func リンク先(_ text: String) -> [UrlLinks.Target] {
+    let chars = Array(text)
+    return UrlLinks.linkTargets(chars, marks: MarkdownPreview.marks(chars))
+}
+do {
+    let text = "前 [題名](https://example.com/a) 後"
+    let t = リンク先(text)
+    checkI("URL_Markdown_個数", t.count, 1)
+    check("URL_Markdown_文字", String(Array(text)[t[0].start..<t[0].end]), "題名")
+    check("URL_Markdown_行き先", t[0].url, "https://example.com/a")
+}
+check("URL_Markdown_題名は除く", リンク先("[x](https://example.com/b \"題名\")").first?.url ?? "", "https://example.com/b")
+check("URL_Markdown_山かっこは除く", リンク先("[x](<https://example.com/c>)").first?.url ?? "", "https://example.com/c")
+checkB("URL_Markdown_空の行き先は無い", リンク先("[x]()").isEmpty, true)
+checkB("URL_開ける_https", UrlLinks.isOpenable("https://example.com"), true)
+checkB("URL_開ける_大文字HTTP", UrlLinks.isOpenable("HTTP://example.com"), true)
+checkB("URL_開けない_javascript", UrlLinks.isOpenable("javascript:alert(1)"), false)
+checkB("URL_開けない_file", UrlLinks.isOpenable("file:///etc/passwd"), false)
+checkB("URL_開けない_mailto", UrlLinks.isOpenable("mailto:a@example.com"), false)
+checkB("URL_開けない_空", UrlLinks.isOpenable("https://"), false)
+checkB("URL_開けない_スキーム無し", UrlLinks.isOpenable("example.com"), false)
+
+// ============================================================
+// 日付・時刻の書式（Windows版・Android版と同じケース）
+// ============================================================
+do {
+    var cal = Calendar(identifier: .gregorian)
+    cal.timeZone = TimeZone(identifier: "Asia/Tokyo")!
+    func at(_ y: Int, _ mo: Int, _ d: Int, _ h: Int = 0, _ mi: Int = 0) -> Date {
+        cal.date(from: DateComponents(year: y, month: mo, day: d, hour: h, minute: mi))!
+    }
+    let day = at(2026, 7, 13) // 月曜
+    check("日付_0", DateTimeFormat.dateString(day, formatIndex: 0, calendar: cal), "2026年07月13日")
+    check("日付_1", DateTimeFormat.dateString(day, formatIndex: 1, calendar: cal), "2026-07-13")
+    check("日付_2", DateTimeFormat.dateString(day, formatIndex: 2, calendar: cal), "20260713")
+    check("日付_3_曜日入り", DateTimeFormat.dateString(day, formatIndex: 3, calendar: cal), "2026年07月13日（月）")
+    let 曜日 = (0..<7).map { i -> String in
+        let s = DateTimeFormat.dateString(at(2026, 7, 13 + i), formatIndex: 3, calendar: cal)
+        return String(s.dropFirst(s.count - 2).prefix(1))
+    }
+    checkArr("日付_曜日は月から日まで", 曜日, ["月", "火", "水", "木", "金", "土", "日"])
+    let t = at(2026, 7, 13, 13, 5)
+    check("時刻_0", DateTimeFormat.timeString(t, formatIndex: 0, calendar: cal), "13:05")
+    check("時刻_1", DateTimeFormat.timeString(t, formatIndex: 1, calendar: cal), "13時05分")
+    check("時刻_2", DateTimeFormat.timeString(t, formatIndex: 2, calendar: cal), "午後1時05分")
+    check("時刻_3_1305形式", DateTimeFormat.timeString(t, formatIndex: 3, calendar: cal), "1305")
+    check("時刻_3_朝も2桁", DateTimeFormat.timeString(at(2026, 7, 13, 9, 5), formatIndex: 3, calendar: cal), "0905")
+    check("時刻_午前0時は12時", DateTimeFormat.timeString(at(2026, 7, 13, 0, 5), formatIndex: 2, calendar: cal), "午前12時05分")
+    check("時刻_正午は午後12時", DateTimeFormat.timeString(at(2026, 7, 13, 12, 0), formatIndex: 2, calendar: cal), "午後12時00分")
+    let m = at(2026, 7, 13, 9, 42)
+    check("時刻の前_なし", DateTimeFormat.timeInsertion(m, formatIndex: 3, prefixIndex: 0, calendar: cal), "0942")
+    check("時刻の前_半角スペース", DateTimeFormat.timeInsertion(m, formatIndex: 3, prefixIndex: 1, calendar: cal), " 0942")
+    check("時刻の前_アンダーバー", DateTimeFormat.timeInsertion(m, formatIndex: 3, prefixIndex: 2, calendar: cal), "_0942")
+    check("時刻の前_範囲外はなし", DateTimeFormat.timeInsertion(m, formatIndex: 0, prefixIndex: 9, calendar: cal), "09:42")
+}
 
 // ============================================================
 // 版の履歴（Android版 VersionHistoryTest と同じケース）
@@ -1180,6 +1313,23 @@ checkB("版_うるう日の版は翌年の二月二十八日のうちは消さ�
 checkB("版_うるう日の版は三月一日から消す",
        VersionHistory.orphanExpired(lastTime: 時刻(2028, 2, 29, 9), now: 時刻(2029, 3, 1, 0), calendar: 版の暦), true)
 
+// -- 消したファイルを取り戻す一覧の「あと○日」
+checkI("版_片付けまであと1日", VersionHistory.orphanDaysLeft(lastTime: 時刻(2026, 9, 30, 15), now: 時刻(2027, 9, 30, 8), calendar: 版の暦), 1)
+checkI("版_片付けまであと366日", VersionHistory.orphanDaysLeft(lastTime: 時刻(2026, 9, 30, 15), now: 時刻(2026, 9, 30, 16), calendar: 版の暦), 366)
+checkI("版_期限を過ぎたら0日", VersionHistory.orphanDaysLeft(lastTime: 時刻(2026, 9, 30, 15), now: 時刻(2028, 1, 1, 0), calendar: 版の暦), 0)
+
+// -- 取り戻すファイルを作る場所
+do {
+    let o = HistoryStore.Orphan(identity: "/a/b/原稿.txt", name: "原稿.txt", path: "/a/b/原稿.txt", lastTime: 0, folderExists: true)
+    check("取り戻す_元の場所が空いていれば元の場所", HistoryStore.restorePath(of: o, saveFolder: "/s", exists: { _ in false }), "/a/b/原稿.txt")
+    check("取り戻す_同名があれば保存フォルダに番号つき",
+          HistoryStore.restorePath(of: o, saveFolder: "/s", exists: { $0 == "/a/b/原稿.txt" }), "/s/原稿.txt")
+    check("取り戻す_保存フォルダにも同名があれば番号を進める",
+          HistoryStore.restorePath(of: o, saveFolder: "/s", exists: { ["/a/b/原稿.txt", "/s/原稿.txt"].contains($0) }), "/s/原稿 2.txt")
+    let lost = HistoryStore.Orphan(identity: "/x/メモ.md", name: "メモ.md", path: "/x/メモ.md", lastTime: 0, folderExists: false)
+    check("取り戻す_元のフォルダが無ければ保存フォルダ", HistoryStore.restorePath(of: lost, saveFolder: "/s", exists: { _ in false }), "/s/メモ.md")
+}
+
 // -- 間引き方
 checkB("版_空なら何も残さない", VersionHistory.toKeep([], now: 版の今, calendar: 版の暦).isEmpty, true)
 let 版の半日 = (1...30).map { 版の今 - Int64($0) * 30 * 60_000 }
@@ -1213,6 +1363,16 @@ do {
     checkI("版_新しい十個は古くても残す", kept.count, 10)
     checkB("版_いちばん新しい版は残る", kept.contains(times.max()!), true)
 }
+
+// ---------- 行間 ----------
+checkD("行間_既定値はそのまま", LineSpacing.normalized(1.3), 1.3)
+checkD("行間_0は既定値", LineSpacing.normalized(0), 1.3)
+checkD("行間_負は既定値", LineSpacing.normalized(-2), 1.3)
+checkD("行間_数でないなら既定値", LineSpacing.normalized(Double.nan), 1.3)
+checkD("行間_下限に寄せる", LineSpacing.normalized(0.5), 1.0)
+checkD("行間_上限に寄せる", LineSpacing.normalized(9), 3.5)
+checkD("行間_0.1刻みに丸める", LineSpacing.normalized(1.4000000000000001), 1.4)
+checkD("行間_1.25は1.3へ", LineSpacing.normalized(1.26), 1.3)
 
 if failures == 0 {
     print("\nすべてのテストに合格")

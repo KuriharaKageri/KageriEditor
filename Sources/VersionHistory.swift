@@ -106,11 +106,22 @@ enum VersionHistory {
     ///
     /// ファイルが本当に消えたかどうかは、ここでは見ない（呼ぶ側で確かめる）
     static func orphanExpired(lastTime: Int64, now: Int64, calendar: Calendar) -> Bool {
-        let last = calendar.startOfDay(for: Date(timeIntervalSince1970: Double(lastTime) / 1000))
-        // 1年を足すと、2月29日は翌年の2月28日になる
-        guard let sameDayNextYear = calendar.date(byAdding: .year, value: 1, to: last),
-              let cutoff = calendar.date(byAdding: .day, value: 1, to: sameDayNextYear) else { return false }
+        guard let cutoff = orphanCutoff(lastTime: lastTime, calendar: calendar) else { return false }
         return Date(timeIntervalSince1970: Double(now) / 1000) >= cutoff
+    }
+
+    /// 片付ける日（その日の0時）。最後の版から1年の翌日。1年を足すと、2月29日は翌年の2月28日になる
+    static func orphanCutoff(lastTime: Int64, calendar: Calendar) -> Date? {
+        let last = calendar.startOfDay(for: Date(timeIntervalSince1970: Double(lastTime) / 1000))
+        guard let sameDayNextYear = calendar.date(byAdding: .year, value: 1, to: last) else { return nil }
+        return calendar.date(byAdding: .day, value: 1, to: sameDayNextYear)
+    }
+
+    /// 片付けられるまであと何日か（0以上）。「消したファイルを取り戻す」の一覧に出す
+    static func orphanDaysLeft(lastTime: Int64, now: Int64, calendar: Calendar) -> Int {
+        guard let cutoff = orphanCutoff(lastTime: lastTime, calendar: calendar) else { return 0 }
+        let today = calendar.startOfDay(for: Date(timeIntervalSince1970: Double(now) / 1000))
+        return max(0, calendar.dateComponents([.day], from: today, to: cutoff).day ?? 0)
     }
 
     /// 間引いたあとに残す版の時刻。

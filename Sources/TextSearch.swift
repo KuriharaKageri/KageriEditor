@@ -232,8 +232,11 @@ enum TextSearch {
         }()
         // 後ろが段落の終わりで足りなければ、そのぶん前を多めに取る
         let spare = max(0, after - (paraEnd - NSMaxRange(first)))
-        let start = max(paraStart, first.location - before - spare)
-        let end = max(NSMaxRange(first), min(paraEnd, NSMaxRange(first) + after))
+        var start = max(paraStart, first.location - before - spare)
+        var end = max(NSMaxRange(first), min(paraEnd, NSMaxRange(first) + after))
+        // サロゲートペア（「𠮷」など）を半分で切らない
+        if start > paraStart, (0xDC00...0xDFFF).contains(text.character(at: start)) { start -= 1 }
+        if end < paraEnd, (0xDC00...0xDFFF).contains(text.character(at: end)) { end += 1 }
         let prefix = start > paraStart ? "…" : ""
         let suffix = end < paraEnd ? "…" : ""
         let shift = prefix.utf16.count - start

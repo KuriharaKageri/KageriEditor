@@ -26,11 +26,14 @@ swiftc -O \
     Sources/SearchMatchList.swift \
     Sources/MarkdownPreview.swift \
     Sources/MarkdownPreviewRenderer.swift \
+    Sources/UrlLinks.swift \
+    Sources/DateTimeFormat.swift \
     Sources/TextSearch.swift \
     Sources/AllTextSearchWindow.swift \
     Sources/VersionHistory.swift \
     Sources/HistoryStore.swift \
     Sources/VersionHistoryWindow.swift \
+    Sources/DeletedFilesWindow.swift \
     Sources/main.swift
 swiftc -O \
     -module-name KageriEditor \
@@ -47,11 +50,14 @@ swiftc -O \
     Sources/SearchMatchList.swift \
     Sources/MarkdownPreview.swift \
     Sources/MarkdownPreviewRenderer.swift \
+    Sources/UrlLinks.swift \
+    Sources/DateTimeFormat.swift \
     Sources/TextSearch.swift \
     Sources/AllTextSearchWindow.swift \
     Sources/VersionHistory.swift \
     Sources/HistoryStore.swift \
     Sources/VersionHistoryWindow.swift \
+    Sources/DeletedFilesWindow.swift \
     Sources/main.swift
 lipo -create \
     "$BUNDLE/Contents/MacOS/$APP_NAME.arm64" \

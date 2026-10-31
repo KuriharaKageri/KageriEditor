@@ -128,6 +128,62 @@ final class HistoryStore {
         }
     }
 
+    /// 元のファイルが消えた履歴。`path` は元の場所（フォルダは束ねる文字列から取る。名前は name.txt の1行目）
+    struct Orphan {
+        let identity: String
+        let name: String
+        let path: String
+        let lastTime: Int64
+        /// 元のフォルダが見えているか（外付けディスクを外している・フォルダを移したときは false。片付けもしない）
+        let folderExists: Bool
+    }
+
+    /// 元のファイルが見当たらない履歴の一覧（最後の版の新しい順）。「消したファイルを取り戻す」で使う。
+    /// フォルダごと見えないものも出す（片付けの [cleanupOrphans] と同じく name.txt から元の場所を読む）。
+    /// 書き出しと取り合わないよう、書き出しのキューで読む
+    func listOrphans() -> [Orphan] {
+        queue.sync {
+            let fm = FileManager.default
+            let dirs = (try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? []
+            var result: [Orphan] = []
+            for dir in dirs {
+                guard let meta = try? String(contentsOf: dir.appendingPathComponent("name.txt"), encoding: .utf8)
+                else { continue }
+                let lines = meta.split(separator: "\n", omittingEmptySubsequences: false)
+                guard lines.count >= 2 else { continue }
+                let name = String(lines[0])
+                let identity = String(lines[1])
+                let parent = (identity as NSString).deletingLastPathComponent
+                guard !name.isEmpty, !parent.isEmpty else { continue }
+                let path = (parent as NSString).appendingPathComponent(name)
+                if fm.fileExists(atPath: path) { continue }
+                var isDir: ObjCBool = false
+                let folderExists = fm.fileExists(atPath: parent, isDirectory: &isDir) && isDir.boolValue
+                let names = (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
+                guard let last = names.compactMap(VersionHistory.parse).map(\.time).max() else { continue }
+                result.append(Orphan(identity: identity, name: name, path: path, lastTime: last,
+                                     folderExists: folderExists))
+            }
+            return result.sorted { $0.lastTime > $1.lastTime }
+        }
+    }
+
+    /// 取り戻すファイルを作る場所。元のフォルダがあり、同じ名前のファイルが無ければ元の場所。
+    /// そうでなければ保存フォルダに、同じ名前があれば「名前 2.txt」のように番号を付けて作る
+    static func restorePath(of orphan: Orphan, saveFolder: String, exists: (String) -> Bool) -> String {
+        if orphan.folderExists && !exists(orphan.path) { return orphan.path }
+        let ext = (orphan.name as NSString).pathExtension
+        let base = (orphan.name as NSString).deletingPathExtension
+        let suffix = ext.isEmpty ? "" : "." + ext
+        var candidate = (saveFolder as NSString).appendingPathComponent(base + suffix)
+        var n = 2
+        while exists(candidate) {
+            candidate = (saveFolder as NSString).appendingPathComponent("\(base) \(n)\(suffix)")
+            n += 1
+        }
+        return candidate
+    }
+
     /// 文書の名前や場所が変わったとき、履歴も一緒に移す（アプリ内のファイル名変更）。
     /// 移し先にすでに履歴があれば、中身を足し合わせる
     func move(from oldIdentity: String, to newIdentity: String, name: String) {

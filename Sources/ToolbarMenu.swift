@@ -1,40 +1,6 @@
 import Cocoa
 
 // ============================================================
-// 日付・時刻の文字列整形（Android版 formatCurrentDate/Time と同じ3書式ずつ）
-// ============================================================
-enum DateTimeFormat {
-    static let dateFormatSamples = ["2026年07月13日", "2026-07-13", "20260713"]
-    static let timeFormatSamples = ["13:05", "13時05分", "午後1時05分"]
-
-    static func currentDateString(formatIndex: Int) -> String {
-        let c = Calendar(identifier: .gregorian).dateComponents([.year, .month, .day], from: Date())
-        let y = c.year ?? 0, m = c.month ?? 0, d = c.day ?? 0
-        switch formatIndex {
-        case 1: return String(format: "%04d-%02d-%02d", y, m, d)
-        case 2: return String(format: "%04d%02d%02d", y, m, d)
-        default: return String(format: "%04d年%02d月%02d日", y, m, d)
-        }
-    }
-
-    static func currentTimeString(formatIndex: Int) -> String {
-        let c = Calendar(identifier: .gregorian).dateComponents([.hour, .minute], from: Date())
-        let h24 = c.hour ?? 0
-        let minuteStr = String(format: "%02d", c.minute ?? 0)
-        switch formatIndex {
-        case 1:
-            return "\(h24)時\(minuteStr)分"
-        case 2:
-            let ampm = h24 < 12 ? "午前" : "午後"
-            let h12 = h24 == 0 ? 12 : (h24 > 12 ? h24 - 12 : h24)
-            return "\(ampm)\(h12)時\(minuteStr)分"
-        default:
-            return String(format: "%02d:%02d", h24, c.minute ?? 0)
-        }
-    }
-}
-
-// ============================================================
 // ツールバーボタン1個の定義（キー・表示名・動作）
 // ============================================================
 struct MenuButtonDef {
@@ -62,7 +28,9 @@ final class MenuBarView: NSView {
         ("new", "新規"),
         ("memo", "メモ"),
         ("open", "開く"),
-        ("history", "履歴"),
+        // キーは "history" のまま据え置き（保存済みの並び順から外れないように）。
+        // 「版の履歴」と紛らわしいので、表示はWindows版と同じ「最近」にした
+        ("history", "最近"),
         ("save", "保存"),
         ("selectall", "全選択"),
         ("cut", "カット"),
@@ -102,12 +70,29 @@ final class MenuBarView: NSView {
         "save", "close",
     ]
 
+    /// 余白（ボタンの間に空ける隙間）
+    static let spacerKey = "spacer"
+
+    /// 段の区切り。ここから先を2段目に並べる（Windows版と同じ。**置けるのは1つだけ**＝3段にはしない）
+    static let rowBreakKey = "rowbreak"
+
+    /// ボタン1段の高さ
+    static let rowHeight: CGFloat = 34
+
     static func loadOrder() -> [String] {
         guard let saved = UserDefaults.standard.string(forKey: "menuOrder") else { return defaultOrder }
         let known = Set(defaultOrder)
+        var seenBreak = false
         var order = saved.split(separator: ",", omittingEmptySubsequences: false)
             .map(String.init)
-            .filter { $0 == "spacer" || known.contains($0) }
+            .filter { key in
+                if key == rowBreakKey {
+                    // 2つ目以降の段の区切りは捨てる（3段にはしない）
+                    defer { seenBreak = true }
+                    return !seenBreak
+                }
+                return key == spacerKey || known.contains(key)
+            }
         for key in defaultOrder where !order.contains(key) { order.append(key) }
         return order
     }
@@ -118,7 +103,11 @@ final class MenuBarView: NSView {
     }
 
     private let scrollView = NSScrollView()
+    /// 段を縦に積む入れ物。中に1段ぶんの横並び（rowStacks）が1つか2つ入る
     private let stack = NSStackView()
+    private var rowStacks: [NSStackView] = []
+    /// 段の数に合わせて変える、ボタン列全体の高さ
+    private var heightConstraint: NSLayoutConstraint?
     private var defsByKey: [String: MenuButtonDef] = [:]
 
     /// 右端の「⋮」。押されたときに出すメニューは持ち主（Document）が組み立てる
@@ -134,8 +123,8 @@ final class MenuBarView: NSView {
     var isDimmedForReading: Bool = false {
         didSet {
             scrollView.alphaValue = isDimmedForReading ? 0.3 : 1.0
-            for view in stack.arrangedSubviews {
-                (view as? NSButton)?.isEnabled = !isDimmedForReading
+            for button in allButtons {
+                button.isEnabled = !isDimmedForReading
             }
         }
     }
@@ -167,10 +156,9 @@ final class MenuBarView: NSView {
         scrollView.hasVerticalScroller = false
         scrollView.drawsBackground = false
 
-        stack.orientation = .horizontal
+        stack.orientation = .vertical
         stack.spacing = 0
-        stack.alignment = .centerY
-        stack.edgeInsets = NSEdgeInsets(top: 0, left: 6, bottom: 0, right: 6)
+        stack.alignment = .leading
         stack.translatesAutoresizingMaskIntoConstraints = false
 
         scrollView.documentView = stack
@@ -202,13 +190,35 @@ final class MenuBarView: NSView {
             scrollView.bottomAnchor.constraint(equalTo: bottomAnchor),
 
             overflowButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
-            overflowButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            // 2段のときも「⋮」は1段目の右端に置く（Windows版と同じ）
+            overflowButton.centerYAnchor.constraint(equalTo: topAnchor, constant: MenuBarView.rowHeight / 2),
             overflowButton.widthAnchor.constraint(equalToConstant: 24),
 
             separator.leadingAnchor.constraint(equalTo: leadingAnchor),
             separator.trailingAnchor.constraint(equalTo: trailingAnchor),
             separator.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
+        let height = heightAnchor.constraint(equalToConstant: MenuBarView.rowHeight)
+        height.isActive = true
+        heightConstraint = height
+    }
+
+    /// 新しい1段を作って積む
+    private func addRow() -> NSStackView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.spacing = 0
+        row.alignment = .centerY
+        row.edgeInsets = NSEdgeInsets(top: 0, left: 6, bottom: 0, right: 6)
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.heightAnchor.constraint(equalToConstant: MenuBarView.rowHeight).isActive = true
+        stack.addArrangedSubview(row)
+        rowStacks.append(row)
+        return row
+    }
+
+    private var allButtons: [NSButton] {
+        rowStacks.flatMap { $0.arrangedSubviews.compactMap { $0 as? NSButton } }
     }
 
     @objc private func overflowClicked(_ sender: Any?) {
@@ -227,14 +237,22 @@ final class MenuBarView: NSView {
             stack.removeArrangedSubview(view)
             view.removeFromSuperview()
         }
+        rowStacks = []
+        var row = addRow()
         let hidden = MenuBarView.loadHidden()
         var needsDivider = false
         for key in MenuBarView.loadOrder() {
-            if key == "spacer" {
+            if key == MenuBarView.rowBreakKey {
+                // loadOrder() が1つまでにしているので、ここで2段目になるのは1回だけ
+                row = addRow()
+                needsDivider = false
+                continue
+            }
+            if key == MenuBarView.spacerKey {
                 let spacer = NSView()
                 spacer.translatesAutoresizingMaskIntoConstraints = false
                 spacer.widthAnchor.constraint(equalToConstant: 20).isActive = true
-                stack.addArrangedSubview(spacer)
+                row.addArrangedSubview(spacer)
                 needsDivider = false
                 continue
             }
@@ -247,23 +265,30 @@ final class MenuBarView: NSView {
                 divider.translatesAutoresizingMaskIntoConstraints = false
                 divider.widthAnchor.constraint(equalToConstant: 1).isActive = true
                 divider.heightAnchor.constraint(equalToConstant: 16).isActive = true
-                stack.addArrangedSubview(divider)
+                row.addArrangedSubview(divider)
             }
 
             let button = NSButton(title: def.label, target: self, action: #selector(buttonTapped(_:)))
             button.bezelStyle = .recessed
             button.font = NSFont.systemFont(ofSize: 12)
             button.identifier = NSUserInterfaceItemIdentifier(key)
-            stack.addArrangedSubview(button)
+            button.isEnabled = !isDimmedForReading
+            row.addArrangedSubview(button)
             needsDivider = true
         }
+        // ボタンが1つも無い段は畳む（段の区切りを先頭や末尾に置いた、2段目を全部隠した、など）
+        for empty in rowStacks where rowStacks.count > 1
+            && !empty.arrangedSubviews.contains(where: { $0 is NSButton }) {
+            stack.removeArrangedSubview(empty)
+            empty.removeFromSuperview()
+            rowStacks.removeAll { $0 === empty }
+        }
+        heightConstraint?.constant = MenuBarView.rowHeight * CGFloat(rowStacks.count)
     }
 
     /// 履歴などのポップアップメニューを、対応するボタンの直下に表示するためのアンカー
     func button(for key: String) -> NSButton? {
-        stack.arrangedSubviews.compactMap { $0 as? NSButton }.first {
-            $0.identifier?.rawValue == key
-        }
+        allButtons.first { $0.identifier?.rawValue == key }
     }
 
     @objc private func buttonTapped(_ sender: NSButton) {
@@ -274,8 +299,8 @@ final class MenuBarView: NSView {
 
 // ============================================================
 // 「メニューの編集」パネル: チェックで表示/非表示、行のドラッグで並べ替え、
-// 「スペースを追加」でボタンの間に空白を挿入できる（Android版のRecyclerView編集画面と
-// 同じ操作感を、NSTableViewの標準的な行ドラッグ並べ替えパターンで実装）
+// 「余白を追加」でボタンの間に空白を、「段の区切りを追加」で2段目を作れる
+// （Windows版と同じ。段の区切りは1つまで）。操作はNSTableViewの標準的な行ドラッグ並べ替え
 // ============================================================
 final class MenuEditorWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
 
@@ -284,10 +309,11 @@ final class MenuEditorWindowController: NSWindowController, NSTableViewDataSourc
     private var order: [String] = MenuBarView.loadOrder()
     private var hidden: Set<String> = MenuBarView.loadHidden()
     private let tableView = NSTableView()
+    private let addRowBreakButton = NSButton()
 
     convenience init() {
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 380, height: 460),
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 560),
             styleMask: [.titled, .closable, .resizable],
             backing: .buffered, defer: false)
         panel.title = "メニューの編集"
@@ -300,7 +326,7 @@ final class MenuEditorWindowController: NSWindowController, NSTableViewDataSourc
         guard let content = window?.contentView else { return }
 
         let hint = NSTextField(wrappingLabelWithString:
-            "チェックでボタンの表示/非表示を切り替えます。右端の「≡」をドラッグすると並べ替えられます。「設定」は常に表示されます。")
+            "チェックを外すと、そのボタンを隠します。行をドラッグすると並べ替えられます。「段の区切り」を置くと、そこから先を2段目に並べます（区切りは1つまで）。")
         hint.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
         hint.textColor = .secondaryLabelColor
         hint.translatesAutoresizingMaskIntoConstraints = false
@@ -322,23 +348,27 @@ final class MenuEditorWindowController: NSWindowController, NSTableViewDataSourc
         tableView.addTableColumn(column)
         scroll.documentView = tableView
 
-        let addSpacerButton = NSButton(title: "スペースを追加", target: self, action: #selector(addSpacer))
+        let addSpacerButton = NSButton(title: "余白を追加", target: self, action: #selector(addSpacer))
+        addRowBreakButton.title = "段の区切りを追加"
+        addRowBreakButton.target = self
+        addRowBreakButton.action = #selector(addRowBreak)
         let resetButton = NSButton(title: "既定に戻す", target: self, action: #selector(resetToDefault))
         let cancelButton = NSButton(title: "キャンセル", target: self, action: #selector(cancelTapped))
         let saveButton = NSButton(title: "保存", target: self, action: #selector(saveTapped))
         saveButton.keyEquivalent = "\r"
-        for b in [addSpacerButton, resetButton, cancelButton, saveButton] {
+        for b in [addSpacerButton, addRowBreakButton, resetButton, cancelButton, saveButton] {
             b.bezelStyle = .rounded
             b.controlSize = .small
         }
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
-        let buttonRow = NSStackView(views: [addSpacerButton, resetButton, spacer, cancelButton, saveButton])
+        let buttonRow = NSStackView(views: [addSpacerButton, addRowBreakButton, resetButton, spacer, cancelButton, saveButton])
         buttonRow.orientation = .horizontal
         buttonRow.spacing = 8
         buttonRow.translatesAutoresizingMaskIntoConstraints = false
 
+        updateRowBreakButton()
         content.addSubview(hint)
         content.addSubview(scroll)
         content.addSubview(buttonRow)
@@ -371,8 +401,9 @@ final class MenuEditorWindowController: NSWindowController, NSTableViewDataSourc
         rowView.spacing = 8
         rowView.edgeInsets = NSEdgeInsets(top: 0, left: 6, bottom: 0, right: 6)
 
-        if key == "spacer" {
-            let label = NSTextField(labelWithString: "── スペース ──")
+        if key == MenuBarView.spacerKey || key == MenuBarView.rowBreakKey {
+            let label = NSTextField(labelWithString: key == MenuBarView.spacerKey
+                                    ? "── 余白 ──" : "━━ 段の区切り（ここから2段目）━━")
             label.textColor = .tertiaryLabelColor
             label.font = NSFont.systemFont(ofSize: 12)
             let filler = NSView()
@@ -444,18 +475,37 @@ final class MenuEditorWindowController: NSWindowController, NSTableViewDataSourc
         guard order.indices.contains(sender.tag) else { return }
         order.remove(at: sender.tag)
         tableView.reloadData()
+        updateRowBreakButton()
     }
 
     @objc private func addSpacer() {
-        order.append("spacer")
+        order.append(MenuBarView.spacerKey)
         tableView.reloadData()
         tableView.scrollRowToVisible(order.count - 1)
+    }
+
+    /// 段の区切りは、いま選んでいる行の前に置く（選んでいなければ、ボタンのおよそ半分の位置）。
+    /// 末尾に足すと2段目が空になり、ドラッグで上まで運ぶ手間がかかるため
+    @objc private func addRowBreak() {
+        guard !order.contains(MenuBarView.rowBreakKey) else { return }
+        let selected = tableView.selectedRow
+        let index = order.indices.contains(selected) ? selected : order.count / 2
+        order.insert(MenuBarView.rowBreakKey, at: index)
+        tableView.reloadData()
+        tableView.scrollRowToVisible(index)
+        updateRowBreakButton()
+    }
+
+    /// 段の区切りは1つまで（3段にはしない）。置いてあれば追加ボタンを押せなくする
+    private func updateRowBreakButton() {
+        addRowBreakButton.isEnabled = !order.contains(MenuBarView.rowBreakKey)
     }
 
     @objc private func resetToDefault() {
         order = MenuBarView.defaultOrder
         hidden = []
         tableView.reloadData()
+        updateRowBreakButton()
     }
 
     @objc private func cancelTapped() {

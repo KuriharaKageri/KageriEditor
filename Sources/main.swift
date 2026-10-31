@@ -61,6 +61,13 @@ final class EditorTextView: NSTextView {
             ?? NSFont.systemFont(ofSize: size)
     }
 
+    /// 本文の段落スタイル。行間（行の高さの倍率）は設定の「行間」から取る
+    static func makeParagraphStyle() -> NSMutableParagraphStyle {
+        let style = NSMutableParagraphStyle()
+        style.lineHeightMultiple = CGFloat(LineSpacing.normalized(UserDefaults.standard.double(forKey: "lineSpacing")))
+        return style
+    }
+
     override func changeFont(_ sender: Any?) {
         let manager = NSFontManager.shared
         let newFont = manager.convert(font ?? EditorTextView.savedFont())
@@ -70,6 +77,148 @@ final class EditorTextView: NSTextView {
         d.set(Double(newFont.pointSize), forKey: "fontSize")
         enclosingScrollView?.verticalRulerView?.needsDisplay = true
         enclosingScrollView?.horizontalRulerView?.needsDisplay = true
+    }
+
+    // ---------- 本文のURL（色と下線・ブラウザーで開く） ----------
+    //
+    // 本文は書き換えない。見つけ方は UrlLinks（Windows版・Android版と同じ規則）。色と下線は
+    // レイアウトマネージャの一時的な属性で当てるので、保存にも「元に戻す」にも入らず、
+    // 閲覧モードの表示の付け替え（MarkdownPreviewRenderer）にも消されない。
+    // 開き方：閲覧モードではクリック（[文字](URL) の文字も開く。ダブルクリックでの単語選択を
+    // 邪魔しないよう、ダブルクリックの間を待ってから開く）、編集中は ⌘クリック
+    // （クリックだけで開くと、カーソルを置く・選ぶ操作をブラウザーに奪われて書く手を邪魔するため）。
+    // 開けるのは http・https だけ
+
+    private var linkRefreshWork: DispatchWorkItem?
+    private var linkRangesShown: [NSRange] = []
+    private var pendingLinkOpen: DispatchWorkItem?
+
+    override func didChangeText() {
+        super.didChangeText()
+        scheduleLinkRefresh()
+    }
+
+    /// 本文が変わって少しあとに、URLの色と下線を付け直す（打っている最中は何度も走らせない）。
+    /// 本文が打つ以外の方法で入れ替わったとき（開く・読み直し）にも呼ぶ。リンクの控えも捨てる
+    func scheduleLinkRefresh() {
+        textRevision += 1
+        linkRefreshWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.refreshLinkAttributes() }
+        linkRefreshWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+    }
+
+    func refreshLinkAttributes() {
+        guard let layout = layoutManager else { return }
+        // 日本語入力の変換中は触らない。確定したあとにもう一度来る
+        if hasMarkedText() {
+            scheduleLinkRefresh()
+            return
+        }
+        let length = (string as NSString).length
+        let found = length < 8 || string.range(of: "http", options: .caseInsensitive) == nil
+            ? [] : UrlLinks.find(string)
+        if found == linkRangesShown { return }
+        for r in linkRangesShown where NSMaxRange(r) <= length {
+            layout.removeTemporaryAttribute(.foregroundColor, forCharacterRange: r)
+            layout.removeTemporaryAttribute(.underlineStyle, forCharacterRange: r)
+        }
+        for r in found {
+            layout.addTemporaryAttributes(
+                [.foregroundColor: NSColor.linkColor, .underlineStyle: NSUnderlineStyle.single.rawValue],
+                forCharacterRange: r)
+        }
+        linkRangesShown = found
+    }
+
+    /// リンクの範囲（UTF-16）と行き先の控え。閲覧モードでは [文字](URL) の文字も入る。
+    /// クリックのたびにも、ポインターを動かすたびにも探し直さないよう、本文か閲覧モードが変わるまで使い回す
+    private var linkTargetsCache: [(range: NSRange, url: String)] = []
+    private var linkTargetsStamp = (revision: -1, reading: false)
+    private var textRevision = 0
+
+    private func linkTargets() -> [(range: NSRange, url: String)] {
+        let reading = !isEditable
+        if linkTargetsStamp.revision == textRevision && linkTargetsStamp.reading == reading { return linkTargetsCache }
+        let ns = string as NSString
+        var result: [(range: NSRange, url: String)] = []
+        if reading, UserDefaults.standard.bool(forKey: "markdownPreview") {
+            // 印は Character の位置で数えてあるので、UTF-16 の位置に直す（1回の走査で足りる）
+            let chars = Array(string)
+            let targets = UrlLinks.linkTargets(chars, marks: MarkdownPreview.marks(chars))
+            if !targets.isEmpty {
+                var offsets = [Int](repeating: 0, count: chars.count + 1)
+                for (i, ch) in chars.enumerated() { offsets[i + 1] = offsets[i] + String(ch).utf16.count }
+                for t in targets {
+                    result.append((NSRange(location: offsets[t.start], length: offsets[t.end] - offsets[t.start]), t.url))
+                }
+            }
+        }
+        for r in UrlLinks.find(string) { result.append((r, ns.substring(with: r))) }
+        linkTargetsCache = result
+        linkTargetsStamp = (textRevision, reading)
+        return result
+    }
+
+    /// 画面の位置にある文字が、リンクの上なら行き先。閲覧モードでは [文字](URL) の文字も数える
+    private func linkURL(at event: NSEvent) -> String? {
+        guard let layout = layoutManager, let container = textContainer, layout.numberOfGlyphs > 0 else { return nil }
+        let viewPoint = convert(event.locationInWindow, from: nil)
+        let point = NSPoint(x: viewPoint.x - textContainerOrigin.x, y: viewPoint.y - textContainerOrigin.y)
+        var fraction: CGFloat = 0
+        let glyph = layout.glyphIndex(for: point, in: container, fractionOfDistanceThroughGlyph: &fraction)
+        // 行の右の余白（文字のない所）を押したときは、行末の文字として数えない
+        let used = layout.lineFragmentUsedRect(forGlyphAt: glyph, effectiveRange: nil)
+        guard used.contains(point) else { return nil }
+        let index = layout.characterIndexForGlyph(at: glyph)
+        return linkTargets().first(where: { index >= $0.range.location && index < NSMaxRange($0.range) })?.url
+    }
+
+    // ---------- リンクの上のポインター（手の形） ----------
+    // 閲覧モードではリンクの上で、編集中は ⌘ を押しているときだけ手の形にする（押せる場面だけ手にする）
+
+    private var linkTracking: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let old = linkTracking { removeTrackingArea(old) }
+        let area = NSTrackingArea(rect: .zero, options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect], owner: self, userInfo: nil)
+        addTrackingArea(area)
+        linkTracking = area
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        if !isEditable || event.modifierFlags.contains(.command), linkURL(at: event) != nil {
+            NSCursor.pointingHand.set()
+        }
+    }
+
+    private func openLink(_ urlString: String) {
+        guard UrlLinks.isOpenable(urlString), let url = URL(string: urlString) else { NSSound.beep(); return }
+        NSWorkspace.shared.open(url)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        pendingLinkOpen?.cancel()
+        pendingLinkOpen = nil
+        // 編集中：⌘クリックでURLなら開く（カーソルは動かさない）
+        if isEditable, event.modifierFlags.contains(.command), event.clickCount == 1,
+           let url = linkURL(at: event) {
+            openLink(url)
+            return
+        }
+        // 閲覧モード：クリックでリンクなら開く。ドラッグで選んだり、ダブルクリックで単語を選んだりしたときは開かない
+        if !isEditable, event.clickCount == 1, let url = linkURL(at: event) {
+            super.mouseDown(with: event) // ボタンを離すまで戻らない
+            if selectedRange().length == 0 {
+                let work = DispatchWorkItem { [weak self] in self?.openLink(url) }
+                pendingLinkOpen = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + NSEvent.doubleClickInterval, execute: work)
+            }
+            return
+        }
+        super.mouseDown(with: event)
     }
 
     /// 右クリック（コンテクスト）メニューに、選択中の文字列があるときだけ
@@ -231,16 +380,25 @@ final class LineNumberRulerView: NSRulerView {
         let relY = convert(NSPoint.zero, from: tv).y
         let originY = tv.textContainerOrigin.y
 
+        let numberFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular)
         let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular),
+            .font: numberFont,
             .foregroundColor: NSColor.secondaryLabelColor,
         ]
 
-        func draw(_ number: Int, fragmentRect: NSRect) {
+        /// 行番号は行の枠の中央ではなく、**本文の字の足元（ベースライン）に合わせて**描く。
+        /// 行間（lineHeightMultiple）を広げると、増えた分は字の上側に足されて字は枠の下寄りに
+        /// 置かれるため、中央揃えだと行間が大きいほど番号が上へずれる。閲覧モードの見出し
+        /// （字が大きい行）でも同じ理由でずれていた。
+        /// baseline は枠の上端からベースラインまでの距離。字のない最終行（extra fragment）は
+        /// 位置が取れないので、nil なら枠の下端から字の下がり分を引いて見積もる
+        func draw(_ number: Int, fragmentRect: NSRect, baseline: CGFloat?) {
             let s = NSAttributedString(string: String(number), attributes: attrs)
             let size = s.size()
             let x = ruleThickness - size.width - 8
-            let y = fragmentRect.minY + originY + relY + (fragmentRect.height - size.height) / 2
+            let base = baseline
+                ?? (fragmentRect.height + (tv.font?.descender ?? -3))
+            let y = fragmentRect.minY + originY + relY + base - numberFont.ascender
             s.draw(at: NSPoint(x: x, y: y))
         }
 
@@ -270,7 +428,8 @@ final class LineNumberRulerView: NSRulerView {
         let numberOfGlyphs = layoutManager.numberOfGlyphs
         while glyphIndex < NSMaxRange(glyphRange) && glyphIndex < numberOfGlyphs {
             let fragmentRect = layoutManager.lineFragmentRect(forGlyphAt: glyphIndex, effectiveRange: &fragmentRange)
-            draw(line, fragmentRect: fragmentRect)
+            draw(line, fragmentRect: fragmentRect,
+                 baseline: layoutManager.location(forGlyphAt: glyphIndex).y)
             glyphIndex = NSMaxRange(fragmentRange)
             line += 1
         }
@@ -278,7 +437,7 @@ final class LineNumberRulerView: NSRulerView {
         // 末尾が改行で終わる場合・空文書の場合の最終行
         if layoutManager.extraLineFragmentTextContainer != nil,
            NSMaxRange(glyphRange) >= numberOfGlyphs {
-            draw(line, fragmentRect: layoutManager.extraLineFragmentRect)
+            draw(line, fragmentRect: layoutManager.extraLineFragmentRect, baseline: nil)
         }
     }
 }
@@ -370,8 +529,23 @@ final class Document: NSDocument, NSTextViewDelegate {
     }
 
     var text = ""
-    var fileEncoding: String.Encoding = .utf8
-    var lineEnding: LineEnding = .lf
+    var fileEncoding: String.Encoding = Document.newFileEncoding
+    var lineEnding: LineEnding = Document.newFileLineEnding
+
+    /// 設定の「新しい文書」の文字コード・改行（まだ保存していない文書の初めの値）
+    static var newFileEncoding: String.Encoding {
+        UserDefaults.standard.integer(forKey: "newFileEncoding") == 1 ? .shiftJIS : .utf8
+    }
+    static var newFileLineEnding: LineEnding {
+        UserDefaults.standard.integer(forKey: "newFileLineEnding") == 1 ? .crlf : .lf
+    }
+
+    /// 設定が変わったとき、まだ保存していない文書を新しい設定に合わせる（「変更あり」の印は付けない）
+    func applyNewFileFormat() {
+        fileEncoding = Document.newFileEncoding
+        lineEnding = Document.newFileLineEnding
+        syncPopups()
+    }
 
     /// 読み込んだファイルの先頭に BOM（U+FEFF）があったか。
     ///
@@ -439,6 +613,7 @@ final class Document: NSDocument, NSTextViewDelegate {
         // 「復帰」などで既にウインドウがある場合は反映
         if let tv = textView {
             tv.string = text
+            (tv as? EditorTextView)?.scheduleLinkRefresh()
             syncPopups()
             restoreCursorPosition()
             updateStatus()
@@ -1030,6 +1205,27 @@ final class Document: NSDocument, NSTextViewDelegate {
         enclosingScrollViewRulersNeedDisplay(for: tv)
     }
 
+    /// 設定パネルの「行間」の変更をこのウインドウに反映する。本文は書き換えず、
+    /// 段落スタイルだけを差し替える（閲覧モードのMarkdown表示は、新しい行間で描き直す）
+    func applyLineSpacing() {
+        guard let tv = textView, let storage = tv.textStorage else { return }
+        let style = EditorTextView.makeParagraphStyle()
+        guard style.lineHeightMultiple != (tv.defaultParagraphStyle?.lineHeightMultiple ?? 0) else { return }
+        preservingScrollTop(tv) {
+            tv.defaultParagraphStyle = style
+            var attributes = tv.typingAttributes
+            attributes[.paragraphStyle] = style
+            tv.typingAttributes = attributes
+            if storage.length > 0 {
+                storage.addAttribute(.paragraphStyle, value: style,
+                                     range: NSRange(location: 0, length: storage.length))
+            }
+            if readingMode { applyMarkdownPreview() }
+            invalidateLineNumberLayout(for: tv)
+        }
+        enclosingScrollViewRulersNeedDisplay(for: tv)
+    }
+
     private func enclosingScrollViewRulersNeedDisplay(for tv: NSTextView) {
         tv.enclosingScrollView?.verticalRulerView?.needsDisplay = true
         tv.enclosingScrollView?.horizontalRulerView?.needsDisplay = true
@@ -1207,8 +1403,7 @@ final class Document: NSDocument, NSTextViewDelegate {
         tv.smartInsertDeleteEnabled = false
 
         let font = EditorTextView.savedFont()
-        let paragraphStyle = NSMutableParagraphStyle()
-        paragraphStyle.lineHeightMultiple = 1.3
+        let paragraphStyle = EditorTextView.makeParagraphStyle()
         tv.defaultParagraphStyle = paragraphStyle
         tv.typingAttributes = [
             .font: font,
@@ -1217,6 +1412,7 @@ final class Document: NSDocument, NSTextViewDelegate {
         ]
 
         tv.string = text
+        tv.scheduleLinkRefresh()
         tv.font = font
         if let storage = tv.textStorage, storage.length > 0 {
             storage.addAttribute(.paragraphStyle, value: paragraphStyle,
@@ -1315,7 +1511,7 @@ final class Document: NSDocument, NSTextViewDelegate {
             menuBar.topAnchor.constraint(equalTo: contentView.topAnchor),
             menuBar.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
             menuBar.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
-            menuBar.heightAnchor.constraint(equalToConstant: 34),
+            // 高さはボタン列が自分で決める（段の区切りで2段になると倍になる）
 
             scrollView.topAnchor.constraint(equalTo: menuBar.bottomAnchor),
             scrollView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
@@ -2053,7 +2249,9 @@ final class Document: NSDocument, NSTextViewDelegate {
     }
 
     @objc func insertTimeCommand(_ sender: Any?) {
-        insertAtCursor(DateTimeFormat.currentTimeString(formatIndex: UserDefaults.standard.integer(forKey: "timeFormat")))
+        insertAtCursor(DateTimeFormat.currentTimeString(
+            formatIndex: UserDefaults.standard.integer(forKey: "timeFormat"),
+            prefixIndex: UserDefaults.standard.integer(forKey: "timePrefix")))
     }
 
     // ---------- 検索（ツールバーボタン用） ----------
@@ -2178,7 +2376,7 @@ final class Document: NSDocument, NSTextViewDelegate {
         let menu = NSMenu()
         let history = RecentHistory.load()
         if history.isEmpty {
-            let empty = NSMenuItem(title: "履歴はまだありません", action: nil, keyEquivalent: "")
+            let empty = NSMenuItem(title: "最近開いたファイルはまだありません", action: nil, keyEquivalent: "")
             empty.isEnabled = false
             menu.addItem(empty)
         } else {
@@ -2235,22 +2433,38 @@ final class Document: NSDocument, NSTextViewDelegate {
     // ---------- 右上「⋮」のプルダウンメニュー ----------
 
     /// メニューバーに常駐させるほどではない項目をまとめたプルダウン。
-    /// 性質ごとに3つのまとまりにしてある（ファイル操作／表示の切替／アプリ全体）。
-    /// 取り消せない「保存せず閉じる」を先頭に置かないための並びでもある。
+    /// **Windows版と同じ並び**（ファイル操作／メモ／表示の切替／設定／ヘルプ）。
+    /// 画面上のメニューバーにもある項目だが、ウインドウから離れずに使えるようにここにも置く
+    /// （とくに「コピーした文字をメモに足す」は画面上のメニューの奥にあって使いにくかった）。
+    /// ショートカットは画面上のメニューと同じものを表示だけしている（キーは画面上のメニューが受ける）。
     @objc func showOverflowMenu(_ sender: Any?) {
         guard let bar = menuBarView else { return }
         let menu = NSMenu()
-        menu.addItem(withTitle: "別名保存", action: #selector(saveAs(_:)), keyEquivalent: "")
-        menu.addItem(withTitle: "ファイル名変更…", action: #selector(renameCommand(_:)), keyEquivalent: "")
-        menu.addItem(withTitle: "版の履歴…", action: #selector(showVersionHistory(_:)), keyEquivalent: "")
-        menu.addItem(withTitle: "印刷…", action: #selector(NSDocument.printDocument(_:)), keyEquivalent: "")
-        menu.addItem(withTitle: "保存せず閉じる", action: #selector(closeDiscardingChanges(_:)), keyEquivalent: "")
+        func add(_ title: String, _ action: Selector, _ key: String = "",
+                 _ mask: NSEvent.ModifierFlags = [.command]) -> NSMenuItem {
+            let item = menu.addItem(withTitle: title, action: action, keyEquivalent: key)
+            item.keyEquivalentModifierMask = mask
+            return item
+        }
+        _ = add("別名で保存…", #selector(saveAs(_:)), "s", [.command, .shift])
+        _ = add("ファイル名を変更…", #selector(renameCommand(_:)), "t", [.control])
+        _ = add("版の履歴…", #selector(showVersionHistory(_:)))
+        _ = add("消したファイルを取り戻す…", #selector(AppDelegate.showDeletedFiles(_:)))
+        _ = add("印刷…", #selector(NSDocument.printDocument(_:)), "p")
+        _ = add("保存せず閉じる…", #selector(closeDiscardingChanges(_:)), "q", [.control])
         menu.addItem(.separator())
-        let reading = menu.addItem(withTitle: "閲覧モード", action: #selector(toggleReadingMode(_:)), keyEquivalent: "")
+        _ = add("コピーした文字をメモに足す", #selector(AppDelegate.appendClipboardToMemo(_:)), "m", [.command, .shift])
+        menu.addItem(.separator())
+        let reading = add("閲覧モード", #selector(toggleReadingMode(_:)), "b", [.control])
         reading.state = readingMode ? .on : .off
+        let invisibles = add("改行・全角スペースを印で見せる", #selector(AppDelegate.toggleInvisibles(_:)))
+        invisibles.state = UserDefaults.standard.bool(forKey: "showInvisibles") ? .on : .off
         menu.addItem(.separator())
-        menu.addItem(withTitle: "設定…", action: #selector(AppDelegate.showPreferences(_:)), keyEquivalent: "")
-        menu.addItem(withTitle: "使い方", action: #selector(AppDelegate.showUserGuide(_:)), keyEquivalent: "")
+        _ = add("設定…", #selector(AppDelegate.showPreferences(_:)), ",")
+        _ = add("メニューの編集…", #selector(AppDelegate.openMenuEditor(_:)))
+        menu.addItem(.separator())
+        _ = add("ショートカット一覧", #selector(AppDelegate.showShortcutHelp(_:)), "/", [.control])
+        _ = add("使い方ガイド", #selector(AppDelegate.showUserGuide(_:)))
         // ボタンの真下に出す
         let anchor = bar.overflowAnchor
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: -4), in: anchor)
@@ -2418,15 +2632,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     private var menuEditorController: MenuEditorWindowController?
     private var helpWindowController: HelpWindowController?
 
+    /// 自動保存の初期値。**初めて使う人は3分ごと**（版の履歴があり、自動保存で上書きしても以前の本文に戻せるため。
+    /// Windows版と同じ）。これまでの利用者は、設定を触っていなくても今までどおり「オフ」のままにする。
+    /// 設定がまだ無く、このアプリの設定も何も残っていなければ新規の利用者とみなす
+    private func migrateAutoSaveDefault() {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: "autoSaveInterval") == nil else { return }
+        let own = Bundle.main.bundleIdentifier.flatMap { defaults.persistentDomain(forName: $0) } ?? [:]
+        // AppKit が自分で書く設定（NSWindow Frame など）は数えない
+        let hasOwnSettings = own.keys.contains { !$0.hasPrefix("NS") && !$0.hasPrefix("Apple") }
+        defaults.set(hasOwnSettings ? 0.0 : 3.0, forKey: "autoSaveInterval")
+    }
+
     func applicationWillFinishLaunching(_ notification: Notification) {
+        migrateAutoSaveDefault()
         UserDefaults.standard.register(defaults: [
             "wrapWidth": 20,
             "fontSize": 16.0,
             "listFontSize": 12.0, // 検索結果一覧・推敲・目次の一覧に使う文字サイズ
+            "lineSpacing": LineSpacing.defaultValue, // 本文の行間（行の高さの倍率。1.0〜3.5）
             "showInvisibles": true,
-            "autoSaveInterval": 0.0, // 分。0 で無効（既定はオフ）
+            "autoSaveInterval": 0.0, // 分。0 で無効（初めて使う人は migrateAutoSaveDefault が3分にする）
             "dateFormat": 0,
             "timeFormat": 0,
+            "timePrefix": 0, // 時刻の前に入れる文字（0＝なし・1＝半角スペース・2＝_）
+            "newFileEncoding": 0, // 新しい文書の文字コード（0＝UTF-8・1＝Shift-JIS）
+            "newFileLineEnding": 0, // 新しい文書の改行（0＝LF・1＝CRLF）
             "assistAlphabet": "keep", // 原稿支援のアルファベット変換（keep/full/half）
             "noParagraphDetect": false, // ⌃Rの非整形で記号による段落認識をしないか
             "darkMode": "system", // "system"/"light"/"dark"
@@ -2536,6 +2767,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             let fontSizeRow = NSStackView(views: [fontSizeTitle, fontSizeField, fontSizeStepper])
             fontSizeRow.orientation = .horizontal
             fontSizeRow.spacing = 8
+
+            // --- 行間（本文の行の高さの倍率） ---
+            let lineSpacingTitle = NSTextField(labelWithString: "行間（倍率）:")
+
+            let lineSpacingFormatter = NumberFormatter()
+            lineSpacingFormatter.allowsFloats = true
+            lineSpacingFormatter.minimumFractionDigits = 1
+            lineSpacingFormatter.maximumFractionDigits = 1
+            lineSpacingFormatter.minimum = NSNumber(value: LineSpacing.minimum)
+            lineSpacingFormatter.maximum = NSNumber(value: LineSpacing.maximum)
+
+            let lineSpacingField = NSTextField()
+            lineSpacingField.formatter = lineSpacingFormatter
+            lineSpacingField.alignment = .right
+            lineSpacingField.bind(.value,
+                                  to: NSUserDefaultsController.shared,
+                                  withKeyPath: "values.lineSpacing",
+                                  options: [.continuouslyUpdatesValue: true])
+            lineSpacingField.widthAnchor.constraint(equalToConstant: 50).isActive = true
+            lineSpacingField.target = self
+            lineSpacingField.action = #selector(lineSpacingChanged(_:))
+
+            let lineSpacingStepper = NSStepper()
+            lineSpacingStepper.minValue = LineSpacing.minimum
+            lineSpacingStepper.maxValue = LineSpacing.maximum
+            lineSpacingStepper.increment = 0.1
+            lineSpacingStepper.valueWraps = false
+            lineSpacingStepper.bind(.value,
+                                    to: NSUserDefaultsController.shared,
+                                    withKeyPath: "values.lineSpacing",
+                                    options: [.continuouslyUpdatesValue: true])
+            lineSpacingStepper.target = self
+            lineSpacingStepper.action = #selector(lineSpacingChanged(_:))
+
+            let lineSpacingHint = NSTextField(labelWithString: "1.0〜3.5（初期値 1.3）")
+            lineSpacingHint.textColor = .secondaryLabelColor
+            lineSpacingHint.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
+
+            let lineSpacingRow = NSStackView(views: [lineSpacingTitle, lineSpacingField, lineSpacingStepper, lineSpacingHint])
+            lineSpacingRow.orientation = .horizontal
+            lineSpacingRow.spacing = 8
 
             // --- 一覧の文字サイズ（検索結果一覧・推敲・目次）。
             //     本文とは別に持つ。一覧は補助的な表示なので本文と同じ大きさに
@@ -2701,9 +2973,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             timePopup.selectItem(at: UserDefaults.standard.integer(forKey: "timeFormat"))
             timePopup.target = self
             timePopup.action = #selector(timeFormatChanged(_:))
-            let timeRow = NSStackView(views: [timeTitle, timePopup])
+            let prefixTitle = NSTextField(labelWithString: "前に入れる文字:")
+            let prefixPopup = NSPopUpButton()
+            prefixPopup.controlSize = .small
+            prefixPopup.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
+            prefixPopup.addItems(withTitles: DateTimeFormat.timePrefixSamples)
+            prefixPopup.selectItem(at: UserDefaults.standard.integer(forKey: "timePrefix"))
+            prefixPopup.target = self
+            prefixPopup.action = #selector(timePrefixChanged(_:))
+            let timeRow = NSStackView(views: [timeTitle, timePopup, prefixTitle, prefixPopup])
             timeRow.orientation = .horizontal
             timeRow.spacing = 8
+
+            // --- 新しい文書の文字コード・改行（開いたファイルには効かない） ---
+            let newFileTitle = NSTextField(labelWithString: "新しい文書:")
+            let newEncodingPopup = NSPopUpButton()
+            newEncodingPopup.controlSize = .small
+            newEncodingPopup.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
+            newEncodingPopup.addItems(withTitles: ["UTF-8", "Shift-JIS"])
+            newEncodingPopup.selectItem(at: UserDefaults.standard.integer(forKey: "newFileEncoding") == 1 ? 1 : 0)
+            newEncodingPopup.target = self
+            newEncodingPopup.action = #selector(newFileFormatChanged(_:))
+            newEncodingPopup.tag = 1
+            let newEolPopup = NSPopUpButton()
+            newEolPopup.controlSize = .small
+            newEolPopup.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
+            newEolPopup.addItems(withTitles: ["改行 LF", "改行 CRLF"])
+            newEolPopup.selectItem(at: UserDefaults.standard.integer(forKey: "newFileLineEnding") == 1 ? 1 : 0)
+            newEolPopup.target = self
+            newEolPopup.action = #selector(newFileFormatChanged(_:))
+            newEolPopup.tag = 2
+            let newFileRow = NSStackView(views: [newFileTitle, newEncodingPopup, newEolPopup])
+            newFileRow.orientation = .horizontal
+            newFileRow.spacing = 8
 
             // --- 上部メニューボタンの編集 ---
             let menuEditButton = NSButton(title: "メニューの編集…", target: self, action: #selector(openMenuEditor(_:)))
@@ -2716,10 +3018,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             // （設定パネルが長くなりすぎるのを避けるため。2026-07-19、ユーザー指示）。
 
             let stack = NSStackView(views: [
-                folderRow, fontSizeRow, listFontRow, wrapRow, noParagraphRow,
+                folderRow, fontSizeRow, lineSpacingRow, listFontRow, wrapRow, noParagraphRow,
                 tabsRow, markdownRow,
                 darkModeTitle, darkModeRow,
-                printFontRow, autoSaveRow, dateRow, timeRow, menuEditRow,
+                printFontRow, autoSaveRow, dateRow, timeRow, newFileRow, menuEditRow,
             ])
             stack.orientation = .vertical
             stack.alignment = .leading
@@ -2757,6 +3059,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     @objc private func fontSizeChanged(_ sender: Any?) {
         for case let document as Document in NSDocumentController.shared.documents {
             document.applyFontSize()
+        }
+    }
+
+    /// 設定パネルの「行間」（フィールド or ステッパー）が変更されたら、開いている全ウインドウに反映する
+    @objc private func lineSpacingChanged(_ sender: Any?) {
+        for case let document as Document in NSDocumentController.shared.documents {
+            document.applyLineSpacing()
         }
     }
 
@@ -2835,6 +3144,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         let newValue = !defaults.bool(forKey: "showInvisibles")
         defaults.set(newValue, forKey: "showInvisibles")
         sender.state = newValue ? .on : .off
+        // 「⋮」から切り替えたときも、画面上のメニューのチェックを合わせる
+        for top in NSApp.mainMenu?.items ?? [] {
+            for item in top.submenu?.items ?? [] where item.action == #selector(toggleInvisibles(_:)) {
+                item.state = sender.state
+            }
+        }
         for case let document as Document in NSDocumentController.shared.documents {
             document.redrawText()
         }
@@ -2848,7 +3163,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         UserDefaults.standard.set(sender.indexOfSelectedItem, forKey: "timeFormat")
     }
 
-    @objc private func openMenuEditor(_ sender: Any?) {
+    @objc private func timePrefixChanged(_ sender: NSPopUpButton) {
+        UserDefaults.standard.set(sender.indexOfSelectedItem, forKey: "timePrefix")
+    }
+
+    /// 新しい文書の文字コード・改行（tag 1＝文字コード、2＝改行）。
+    /// まだ保存していない文書にはその場で反映する（「変更あり」の印は付けない）。開いたファイルには効かない
+    @objc private func newFileFormatChanged(_ sender: NSPopUpButton) {
+        let key = sender.tag == 1 ? "newFileEncoding" : "newFileLineEnding"
+        UserDefaults.standard.set(sender.indexOfSelectedItem, forKey: key)
+        for case let document as Document in NSDocumentController.shared.documents where document.fileURL == nil {
+            document.applyNewFileFormat()
+        }
+    }
+
+    @objc func openMenuEditor(_ sender: Any?) {
         let controller = MenuEditorWindowController()
         menuEditorController = controller
         controller.window?.center()
@@ -2878,7 +3207,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         let text = """
             Ctrl+N　新規
             Ctrl+O　開く
-            Ctrl+D　履歴
+            Ctrl+D　最近
             Ctrl+S　保存
             Ctrl+G　別名保存
             Ctrl+T　ファイル名変更
@@ -2931,7 +3260,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         menu.removeAllItems()
         let history = RecentHistory.load()
         if history.isEmpty {
-            let empty = NSMenuItem(title: "履歴はまだありません", action: nil, keyEquivalent: "")
+            let empty = NSMenuItem(title: "最近開いたファイルはまだありません", action: nil, keyEquivalent: "")
             empty.isEnabled = false
             menu.addItem(empty)
             return
@@ -2988,6 +3317,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd HH:mm"
         appendToQuickMemo("\(formatter.string(from: Date()))\n\(selected)\n")
+    }
+
+    /// 「消したファイルを取り戻す…」。元のファイルが見当たらない文書を、残してある版から作り直す。
+    /// 版の履歴は名前のある文書からしか開けないので、どの文書からでも（文書が無くても）開けるようにここに置く
+    @objc func showDeletedFiles(_ sender: Any?) {
+        DeletedFilesWindowController.show()
     }
 
     /// ⌘⇧M：クリップボードの内容を、日時を添えてメモの末尾に追記する。
@@ -3076,16 +3411,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         memoItem.keyEquivalentModifierMask = [.command, .option]
         // Servicesメニュー（他アプリの選択文字列からメモへ追記）は署名/公証がないと
         // 一部アプリのサービス一覧に出ないため、当面はクリップボード経由の代替として用意
-        let pasteMemoItem = fileMenu.addItem(withTitle: "クリップボードからメモに追記",
+        let pasteMemoItem = fileMenu.addItem(withTitle: "コピーした文字をメモに足す",
                          action: #selector(AppDelegate.appendClipboardToMemo(_:)), keyEquivalent: "m")
         pasteMemoItem.target = self
         pasteMemoItem.keyEquivalentModifierMask = [.command, .shift]
         fileMenu.addItem(withTitle: "開く…",
                          action: #selector(NSDocumentController.openDocument(_:)), keyEquivalent: "o")
 
-        let historyMenu = NSMenu(title: "履歴")
+        // 最近開いたファイル（「版の履歴」と紛らわしいので、Windows版と同じ「最近」と呼ぶ）
+        let historyMenu = NSMenu(title: "最近")
         historyMenu.delegate = self
-        let historyItem = NSMenuItem(title: "履歴", action: nil, keyEquivalent: "")
+        let historyItem = NSMenuItem(title: "最近", action: nil, keyEquivalent: "")
         historyItem.submenu = historyMenu
         fileMenu.addItem(historyItem)
         self.historyMenu = historyMenu
@@ -3109,16 +3445,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         let saveAs = fileMenu.addItem(withTitle: "別名で保存…",
                                       action: #selector(NSDocument.saveAs(_:)), keyEquivalent: "s")
         saveAs.keyEquivalentModifierMask = [.command, .shift]
-        let rename = fileMenu.addItem(withTitle: "ファイル名変更…",
+        let rename = fileMenu.addItem(withTitle: "ファイル名を変更…",
                          action: #selector(Document.renameCommand(_:)), keyEquivalent: "t")
         rename.keyEquivalentModifierMask = [.control]
-        let renameShift = fileMenu.addItem(withTitle: "ファイル名変更…",
+        let renameShift = fileMenu.addItem(withTitle: "ファイル名を変更…",
                          action: #selector(Document.renameCommand(_:)), keyEquivalent: "t")
         renameShift.keyEquivalentModifierMask = [.control, .shift]
         renameShift.isHidden = true
         renameShift.allowsKeyEquivalentWhenHidden = true
         fileMenu.addItem(withTitle: "版の履歴…",
                          action: #selector(Document.showVersionHistory(_:)), keyEquivalent: "")
+        fileMenu.addItem(withTitle: "消したファイルを取り戻す…",
+                         action: #selector(AppDelegate.showDeletedFiles(_:)), keyEquivalent: "")
         fileMenu.addItem(withTitle: "最後に保存した状態に戻す",
                          action: #selector(NSDocument.revertToSaved(_:)), keyEquivalent: "")
         fileMenu.addItem(.separator())
@@ -3288,7 +3626,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                                                keyEquivalent: "t")
         fontPanelItem.target = NSFontManager.shared
         formatMenu.addItem(.separator())
-        let invisiblesItem = formatMenu.addItem(withTitle: "改行・全角スペースを表示",
+        let invisiblesItem = formatMenu.addItem(withTitle: "改行・全角スペースを印で見せる",
                                                 action: #selector(AppDelegate.toggleInvisibles(_:)),
                                                 keyEquivalent: "")
         invisiblesItem.state = UserDefaults.standard.bool(forKey: "showInvisibles") ? .on : .off
@@ -3339,7 +3677,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                         action: #selector(NSDocumentController.newDocument(_:)), key: "n")
         addControlAlias(to: fileMenu, title: "開く…",
                         action: #selector(NSDocumentController.openDocument(_:)), key: "o")
-        addControlAlias(to: fileMenu, title: "履歴",
+        addControlAlias(to: fileMenu, title: "最近",
                         action: #selector(AppDelegate.showHistoryMenu(_:)), key: "d")
         addControlAlias(to: fileMenu, title: "保存",
                         action: #selector(NSDocument.save(_:)), key: "s")

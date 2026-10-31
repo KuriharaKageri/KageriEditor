@@ -784,6 +784,23 @@ enum AssistPresetStore {
 }
 
 // ============================================================
+// 行間（本文の行の高さの倍率）
+// ============================================================
+enum LineSpacing {
+    static let defaultValue = 1.3
+    static let minimum = 1.0
+    static let maximum = 3.5
+
+    /// 設定値を使える値にそろえる。0・負・数でない値は既定値、範囲外は端に寄せ、
+    /// 0.1刻みに丸める（ステッパーで足し引きしたときの 1.4000000000000001 のような誤差を捨てる）
+    static func normalized(_ value: Double) -> Double {
+        guard value.isFinite, value > 0 else { return defaultValue }
+        let clamped = Swift.min(Swift.max(value, minimum), maximum)
+        return (clamped * 10).rounded() / 10
+    }
+}
+
+// ============================================================
 // 1行目からのファイル名生成
 // ============================================================
 enum FileNaming {
@@ -823,7 +840,44 @@ enum FileNaming {
         // 先頭のドットは不可視ファイルになるので取り除く
         while name.hasPrefix(".") { name.removeFirst() }
         if name.isEmpty { name = "無題" }
-        return name
+        return avoidReservedName(name)
+    }
+
+    /// Windows が装置の名前として取ってある名前（CON・PRN・AUX・NUL・COM0〜9・LPT0〜9・CONIN$・CONOUT$。
+    /// 上付きの ¹²³ も）と同じなら、英数字を全角にする（「CON」→「ＣＯＮ」。Windows版と同じ規則）。
+    /// Windows 10 では装置の名前として扱われ、同期で届いたファイルを開けない・保存できない恐れがある。
+    /// 最初の「.」より前を、末尾の空白を除いて見分けるので、「CON.決意」「NUL .メモ」も同じ扱いにする
+    static func avoidReservedName(_ name: String) -> String {
+        let head: Substring
+        let tail: Substring
+        if let dot = name.firstIndex(of: ".") {
+            head = name[name.startIndex..<dot]
+            tail = name[dot...]
+        } else {
+            head = Substring(name)
+            tail = ""
+        }
+        var trimmed = head
+        while trimmed.last == " " { trimmed.removeLast() }
+        guard isReservedName(String(trimmed)) else { return name }
+        var wide = ""
+        for scalar in head.unicodeScalars {
+            if scalar.value >= 0x21 && scalar.value <= 0x7E, let w = Unicode.Scalar(scalar.value - 0x21 + 0xFF01) {
+                wide.unicodeScalars.append(w)
+            } else {
+                wide.unicodeScalars.append(scalar)
+            }
+        }
+        return wide + tail
+    }
+
+    private static func isReservedName(_ s: String) -> Bool {
+        let u = s.uppercased()
+        if ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(u) { return true }
+        let scalars = Array(u.unicodeScalars)
+        guard scalars.count == 4, u.hasPrefix("COM") || u.hasPrefix("LPT") else { return false }
+        let last = scalars[3]
+        return ("0"..."9").contains(last) || last == "¹" || last == "²" || last == "³"
     }
 
     /// 新しく作る文書は必ずこの拡張子（原則）
