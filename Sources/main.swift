@@ -1812,6 +1812,7 @@ final class Document: NSDocument, NSTextViewDelegate {
     private func applyTransform(_ transform: (String) -> String,
                                 noSelectionScope: TextTransform.NoSelectionScope = .wholeDocument,
                                 recognizeParagraphs: Bool = true,
+                                wrapLimit: Double = 0,
                                 historyReason: VersionHistory.Reason? = nil) {
         guard let tv = textView else { return }
         let full = tv.string as NSString
@@ -1820,7 +1821,8 @@ final class Document: NSDocument, NSTextViewDelegate {
         let range = TextTransform.targetRange(in: full,
                                               selection: selection,
                                               noSelectionScope: noSelectionScope,
-                                              recognizeParagraphs: recognizeParagraphs)
+                                              recognizeParagraphs: recognizeParagraphs,
+                                              wrapLimit: wrapLimit)
         guard range.length > 0 else { return }
         let target = full.substring(with: range)
         let replaced = transform(target)
@@ -1853,9 +1855,16 @@ final class Document: NSDocument, NSTextViewDelegate {
     /// 区別しない」を入れていると、切れ目は空行と見出しだけになる
     @objc func removeNewlinesCommand(_ sender: Any?) {
         let noParagraphDetect = UserDefaults.standard.bool(forKey: "noParagraphDetect")
-        applyTransform({ TextTransform.removeNewlines($0, recognizeParagraphs: !noParagraphDetect) },
+        // 整形の字数も渡す：整形が折り返しの続きにたまたま置いた開きカッコの行を、
+        // 段落の先頭と取り違えないため（整形コマンドと同じ字数。未設定・0なら20）
+        var wrapCount = UserDefaults.standard.integer(forKey: "wrapWidth")
+        if wrapCount <= 0 { wrapCount = 20 }
+        let wrapLimit = Double(wrapCount)
+        applyTransform({ TextTransform.removeNewlines($0, recognizeParagraphs: !noParagraphDetect,
+                                                      wrapLimit: wrapLimit) },
                        noSelectionScope: .currentParagraph,
                        recognizeParagraphs: !noParagraphDetect,
+                       wrapLimit: wrapLimit,
                        historyReason: .unwrap)
     }
 

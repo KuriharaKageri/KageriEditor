@@ -252,14 +252,18 @@ enum TextTransform {
     /// recognizeParagraphs=false（設定「段落を区別しない」）の場合は、
     /// 記号による段落認識（isParagraphHead）を行わず、空行だけを
     /// 段落区切りとして残す。
-    static func removeNewlines(_ text: String, recognizeParagraphs: Bool = true) -> String {
+    ///
+    /// wrapLimit（整形の字数）が正のときは、整形が折り返しの続きにたまたま置いた開きカッコを
+    /// 段落の先頭と取り違えない（[looksWrappedBefore]）。0以下なら従来どおり。
+    static func removeNewlines(_ text: String, recognizeParagraphs: Bool = true,
+                               wrapLimit: Double = 0) -> String {
         let lines = text.components(separatedBy: "\n")
         var out = ""
         for i in lines.indices {
             let line = lines[i]
             if i > 0,
                keepsNewline(between: lines[i - 1], and: line,
-                            recognizeParagraphs: recognizeParagraphs) {
+                            recognizeParagraphs: recognizeParagraphs, wrapLimit: wrapLimit) {
                 out += "\n"
             }
             out += line
@@ -273,14 +277,42 @@ enum TextTransform {
     /// ・空行（空白だけの行も書き手には空行に見えるので同じ扱い）
     /// ・見出し行の前後（行頭の記号だけ見ていると見出しの「後ろ」を守れない）
     /// ・段落の印で始まる行（一字下げ・括弧・箇条書き記号・丸付き数字など）。
-    /// 　ただし recognizeParagraphs が false のときはこの判定をしない
+    /// 　ただし recognizeParagraphs が false のときはこの判定をしない。
+    /// 　また wrapLimit（整形の字数）が正のときは、整形で折られた行の続きに偶然来た
+    /// 　開きカッコの行は、切れ目にしない（2.51。Windows版1.3.2と同じ規則）
     static func keepsNewline(between prev: String, and line: String,
-                             recognizeParagraphs: Bool) -> Bool {
+                             recognizeParagraphs: Bool, wrapLimit: Double = 0) -> Bool {
         if line.trimmingCharacters(in: .whitespaces).isEmpty { return true }
         if prev.trimmingCharacters(in: .whitespaces).isEmpty { return true }
         if isHeadingLine(line) || isHeadingLine(prev) { return true }
-        if recognizeParagraphs, let first = line.first, isParagraphHead(first) { return true }
+        if recognizeParagraphs, let first = line.first, isParagraphHead(first),
+           !looksWrappedBefore(prev: prev, line: line, wrapLimit: wrapLimit) { return true }
         return false
+    }
+
+    /// 文の終わりを示す文字（これで終わる行のあとの開きカッコは、新しい段落とみなす）
+    private static let sentenceEnds: Set<Character> = [
+        "。", "！", "？", "!", "?", "．", ".", "…", "‥",
+        "」", "』", "）", ")", "】", "〉", "》", "〕", "］", "]", "｝", "}", "”", "’", "〟",
+    ]
+
+    /// 行頭にあると偶然そこへ折られうる開きカッコ（引用符の " ' は開き閉じの区別がないので除く）
+    private static let openingBrackets: Set<Character> = [
+        "「", "『", "（", "(", "【", "〈", "《", "〔", "［", "[", "｛", "{", "〝", "“", "‘",
+    ]
+
+    /// 行頭の開きカッコが、整形で折られた行の続きに偶然来たものか。
+    /// 整形（wrap）は「次の1字を足すと字数を超えるとき」に折るので、折られた行の幅は
+    /// 「字数 − 次の字の幅」より必ず大きい（行頭禁則でぶら下げた行は、字数より大きい）。
+    /// 前の行がそこまで詰まっていて、文の終わりの記号で終わっていなければ、折り返しの続きとみなす。
+    /// 外れても（段落の最後がちょうど詰まっていて句点も無いとき）、従来どおり段落とみなして
+    /// 改行が1つ残るだけで、害は小さい。wrapLimit が0以下なら判定しない（従来の動き）
+    private static func looksWrappedBefore(prev: String, line: String, wrapLimit: Double) -> Bool {
+        guard wrapLimit > 0, let last = prev.last, let first = line.first,
+              openingBrackets.contains(first), !sentenceEnds.contains(last) else { return false }
+        var width = 0.0
+        for ch in prev { width += CharWidth.width(of: ch) }
+        return width > wrapLimit - CharWidth.width(of: first)
     }
 
     /// 全角・半角スペースを行単位で除去する（原稿支援の除去処理の中核）。
@@ -657,10 +689,12 @@ enum TextTransform {
     /// 選択がないときは scope に従う。
     /// recognizeParagraphs は currentParagraph のときだけ意味を持ち、
     /// 設定「非整形で段落を区別しない」を裏返した値（＝非整形へ渡すものと同じ）を受け取る。
+    /// wrapLimit も非整形へ渡すものと同じ値（整形の字数）を受け取る。範囲決めと実行で規則を変えない。
     static func targetRange(in text: NSString,
                             selection: NSRange,
                             noSelectionScope: NoSelectionScope,
-                            recognizeParagraphs: Bool = true) -> NSRange {
+                            recognizeParagraphs: Bool = true,
+                            wrapLimit: Double = 0) -> NSRange {
         guard selection.length > 0 else {
             switch noSelectionScope {
             case .wholeDocument:
@@ -678,7 +712,8 @@ enum TextTransform {
             case .currentParagraph:
                 return paragraphRange(in: text,
                                       caret: min(selection.location, text.length),
-                                      recognizeParagraphs: recognizeParagraphs)
+                                      recognizeParagraphs: recognizeParagraphs,
+                                      wrapLimit: wrapLimit)
             }
         }
         var range = selection
@@ -703,7 +738,8 @@ enum TextTransform {
     /// 行末の改行は含めない。空行や見出しの上にカーソルがあるときは、その1行だけになる。
     private static func paragraphRange(in text: NSString,
                                        caret: Int,
-                                       recognizeParagraphs: Bool) -> NSRange {
+                                       recognizeParagraphs: Bool,
+                                       wrapLimit: Double) -> NSRange {
         let lines = text.components(separatedBy: "\n")
         var starts = [Int](repeating: 0, count: lines.count)
         var pos = 0
@@ -718,12 +754,12 @@ enum TextTransform {
         var last = index
         while first > 0,
               !keepsNewline(between: lines[first - 1], and: lines[first],
-                            recognizeParagraphs: recognizeParagraphs) {
+                            recognizeParagraphs: recognizeParagraphs, wrapLimit: wrapLimit) {
             first -= 1
         }
         while last < lines.count - 1,
               !keepsNewline(between: lines[last], and: lines[last + 1],
-                            recognizeParagraphs: recognizeParagraphs) {
+                            recognizeParagraphs: recognizeParagraphs, wrapLimit: wrapLimit) {
             last += 1
         }
         let start = starts[first]

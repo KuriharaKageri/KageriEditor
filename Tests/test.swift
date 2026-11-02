@@ -1374,6 +1374,48 @@ checkD("行間_上限に寄せる", LineSpacing.normalized(9), 3.5)
 checkD("行間_0.1刻みに丸める", LineSpacing.normalized(1.4000000000000001), 1.4)
 checkD("行間_1.25は1.3へ", LineSpacing.normalized(1.26), 1.3)
 
+// ---------- 非整形：整形が偶然行頭に置いた開きカッコを段落の先頭と取り違えない（2.51・Windows版1.3.2と同じ値） ----------
+do {
+    let ten = "あいうえおかきくけこ"
+    func rn(_ t: String, _ limit: Double, _ recognize: Bool = true) -> String {
+        TextTransform.removeNewlines(t, recognizeParagraphs: recognize, wrapLimit: limit)
+    }
+    check("偶然カッコ_字数いっぱいの次の開きカッコはつなぐ",
+          rn(ten + "\n「さしすせそ」と言った。", 10), ten + "「さしすせそ」と言った。")
+    check("偶然カッコ_字数なし(0)なら従来どおり段落",
+          rn(ten + "\n「さしすせそ」と言った。", 0), ten + "\n「さしすせそ」と言った。")
+    check("偶然カッコ_前が8字なら変わらない",
+          rn("あいうえおかきく\n「さしすせそ」と言った。", 10), "あいうえおかきく\n「さしすせそ」と言った。")
+    check("偶然カッコ_前が句点で終わるなら段落のまま",
+          rn("あいうえおかきくけ。\n「さしすせそ」と言った。", 10), "あいうえおかきくけ。\n「さしすせそ」と言った。")
+    check("偶然カッコ_前が閉じカッコで終わるなら段落のまま",
+          rn("「あいうえおかきく」\n「さしすせそ」", 10), "「あいうえおかきく」\n「さしすせそ」")
+    check("偶然カッコ_ぶら下げで11字ならつなぐ",
+          rn("あいうえおかきくけこ、\n「さしすせそ」", 10), "あいうえおかきくけこ、「さしすせそ」")
+    check("偶然カッコ_半角カッコ（前は10.5・括弧は0.5）",
+          rn("あいうえおかきくけabc\n(d)", 10), "あいうえおかきくけabc(d)")
+    for (open, tail) in [("【", "注】…"), ("〔", "注〕…"), ("『", "書名』…"), ("（", "注）")] {
+        check("偶然カッコ_\(open)でもつなぐ", rn(ten + "\n" + open + tail, 10), ten + open + tail)
+    }
+    for head in ["・りんご", "●みかん", "　字下げ", "①電源", "※注記", "―会話"] {
+        check("偶然カッコ_開きカッコ以外は対象外_\(head)", rn(ten + "\n" + head, 10), ten + "\n" + head)
+    }
+    check("偶然カッコ_段落を区別しない設定ならつなぐ", rn(ten + "\n・りんご", 10, false), ten + "・りんご")
+    let w1 = "あいうえおかきくけこ「さしすせそ」なにぬねの。"
+    check("偶然カッコ_整形してから非整形で元に戻る", rn(TextTransform.wrap(w1, limit: 10), 10), w1)
+    let w2 = "あいうえおかきくけ「こさしすせ」そ"
+    check("偶然カッコ_整形してから非整形で元に戻る（字数9）", rn(TextTransform.wrap(w2, limit: 9), 9), w2)
+    check("偶然カッコ_空行をはさむと変わらない",
+          rn(ten + "\n\n「さしすせそ」", 10), ten + "\n\n「さしすせそ」")
+    let ns = (ten + "\n「さしすせそ」と言った。") as NSString
+    let r10 = TextTransform.targetRange(in: ns, selection: NSRange(location: 0, length: 0),
+                                        noSelectionScope: .currentParagraph, recognizeParagraphs: true, wrapLimit: 10)
+    checkB("偶然カッコ_カーソルのある段落は2行とも（字数10）", r10.length == ns.length, true)
+    let r0 = TextTransform.targetRange(in: ns, selection: NSRange(location: 0, length: 0),
+                                       noSelectionScope: .currentParagraph, recognizeParagraphs: true, wrapLimit: 0)
+    checkB("偶然カッコ_字数0なら先頭の1行だけ", r0.length == (ten as NSString).length, true)
+}
+
 if failures == 0 {
     print("\nすべてのテストに合格")
 } else {
