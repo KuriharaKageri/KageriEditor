@@ -1365,6 +1365,16 @@ do {
 }
 
 // ---------- 行間 ----------
+// 改行コードの正規化
+check("改行_CRLFはLF", LineEndings.normalize("a\r\nb"), "a\nb")
+check("改行_CRCRLFも1つの改行", LineEndings.normalize("a\r\r\nb"), "a\nb")
+check("改行_CRだけは改行", LineEndings.normalize("a\rb"), "a\nb")
+check("改行_CRが続くだけなら続いた数ぶん", LineEndings.normalize("a\r\rb"), "a\n\nb")
+check("改行_混在", LineEndings.normalize("a\r\nb\nc\rd\r\r\ne"), "a\nb\nc\nd\ne")
+check("改行_LFはそのまま", LineEndings.normalize("a\n\nb"), "a\n\nb")
+check("改行_空文字", LineEndings.normalize(""), "")
+check("改行_末尾のCRLF", LineEndings.normalize("a\r\n"), "a\n")
+checkB("改行_結果にCRが残らない", LineEndings.normalize("x\r\r\n\r\ny\rz").utf8.contains(13), false)
 checkD("行間_既定値はそのまま", LineSpacing.normalized(1.3), 1.3)
 checkD("行間_0は既定値", LineSpacing.normalized(0), 1.3)
 checkD("行間_負は既定値", LineSpacing.normalized(-2), 1.3)

@@ -51,6 +51,20 @@ final class InvisiblesLayoutManager: NSLayoutManager {
 // ============================================================
 final class EditorTextView: NSTextView {
 
+    /// 貼り付け・ドロップで入る文字列の改行を「\n」にそろえる。
+    /// Windows 由来の文は「\r\n」のまま入り、本文に残ると矢印キーの選択が狂う
+    override func readSelection(from pboard: NSPasteboard, type: NSPasteboard.PasteboardType) -> Bool {
+        if type == .string, isEditable,
+           let raw = pboard.string(forType: .string), raw.utf8.contains(13) {
+            let range = selectedRange()
+            guard shouldChangeText(in: range, replacementString: LineEndings.normalize(raw)) else { return false }
+            replaceCharacters(in: range, with: LineEndings.normalize(raw))
+            didChangeText()
+            return true
+        }
+        return super.readSelection(from: pboard, type: type)
+    }
+
     static func savedFont() -> NSFont {
         let d = UserDefaults.standard
         let name = d.string(forKey: "fontName") ?? "HiraMinProN-W3"
@@ -605,10 +619,8 @@ final class Document: NSDocument, NSTextViewDelegate {
         }
         hadByteOrderMark = text.hasPrefix("\u{FEFF}")
         if hadByteOrderMark { text.removeFirst() }
-        lineEnding = text.contains("\r\n") ? .crlf : .lf
-        text = text
-            .replacingOccurrences(of: "\r\n", with: "\n")
-            .replacingOccurrences(of: "\r", with: "\n")
+        lineEnding = text.utf8.contains(13) && text.contains("\r\n") ? .crlf : .lf
+        text = LineEndings.normalize(text)
 
         // 「復帰」などで既にウインドウがある場合は反映
         if let tv = textView {
@@ -643,9 +655,11 @@ final class Document: NSDocument, NSTextViewDelegate {
 
     override func data(ofType typeName: String) throws -> Data {
         if let tv = textView { text = tv.string }
+        // 本文に「\r」が紛れていても、「\r\r\n」のような二重の改行にしない
+        let body = LineEndings.normalize(text)
         var out = lineEnding == .crlf
-            ? text.replacingOccurrences(of: "\n", with: "\r\n")
-            : text
+            ? body.replacingOccurrences(of: "\n", with: "\r\n")
+            : body
         // 元のファイルにあった BOM は書き戻す（勝手に落とさない）
         if hadByteOrderMark { out = "\u{FEFF}" + out }
         guard let data = out.data(using: fileEncoding, allowLossyConversion: false) else {

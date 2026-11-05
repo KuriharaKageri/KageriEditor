@@ -820,6 +820,41 @@ enum AssistPresetStore {
 }
 
 // ============================================================
+// 改行コードの正規化（本文の中の改行は「\n」1文字に統一する）
+// ============================================================
+enum LineEndings {
+    /// 本文に入れる前に、改行を「\n」1文字にそろえる。
+    /// 「\r\n」は Swift でも AppKit でも**1つの文字**として扱われるため、本文に残ると
+    /// 矢印キーでの選択がその位置で起点を取り違える（選択 0 字になる）。
+    /// 「\r」が連なったあとに「\n」が来るもの（\r\r\n ＝ 変換が二重にかかったもの）も1つの改行にする。
+    /// 「\n」のない「\r」は、古い Mac の改行としてそれぞれ「\n」にする。
+    /// 文字ではなく Unicode スカラーで見る（「\r\n」を1文字とみなさないため）。
+    static func normalize(_ text: String) -> String {
+        guard text.utf8.contains(13) else { return text }
+        let scalars = Array(text.unicodeScalars)
+        var out = String.UnicodeScalarView()
+        var i = 0
+        while i < scalars.count {
+            if scalars[i].value == 13 {
+                var j = i
+                while j < scalars.count, scalars[j].value == 13 { j += 1 }
+                if j < scalars.count, scalars[j].value == 10 {
+                    out.append("\n")
+                    i = j + 1
+                } else {
+                    for _ in i..<j { out.append("\n") }
+                    i = j
+                }
+            } else {
+                out.append(scalars[i])
+                i += 1
+            }
+        }
+        return String(out)
+    }
+}
+
+// ============================================================
 // 行間（本文の行の高さの倍率）
 // ============================================================
 enum LineSpacing {
